@@ -16,6 +16,7 @@ export interface SignalingConfig {
 export interface SignalingDependencies {
   now(): number;
   nextRoomCode(): string;
+  nextRelayCredential?(): string;
 }
 
 export type RelaySignal =
@@ -37,13 +38,22 @@ export type ServerMessage =
   | { type: "peer_left" }
   | { type: "join_cancelled" }
   | { type: "room_closed" }
+  | { type: "relay_requested" }
+  | { type: "relay_declined" }
+  | { type: "relay_ready"; token: string; role: "sender" | "receiver" }
   | { type: "pong"; nonce: string }
   | { type: "signal"; signal: RelaySignal }
   | { type: "error"; code: string; message: string; retryAfterMs?: number };
 
 export type SignalingAction =
   | { kind: "send"; peerId: string; message: ServerMessage }
-  | { kind: "close"; peerId: string; code: number; reason: string };
+  | { kind: "close"; peerId: string; code: number; reason: string }
+  | {
+      kind: "authorize_relay";
+      sessionId: string;
+      senderToken: string;
+      receiverToken: string;
+    };
 
 interface Peer {
   id: string;
@@ -57,7 +67,8 @@ interface Room {
   senderId: string;
   pendingReceiverId?: string;
   receiverId?: string;
-  expiresAt: number;
+  expiresAt?: number;
+  relayRequested?: boolean;
 }
 
 export class SignalingCore {
@@ -139,7 +150,7 @@ export class SignalingCore {
     const now = this.dependencies.now();
     this.sweepJoinAttempts(now);
     for (const room of this.rooms.values()) {
-      if (room.expiresAt > now) continue;
+      if (room.expiresAt === undefined || room.expiresAt > now) continue;
       actions.push(...this.expireRoom(room));
     }
     return actions;
@@ -241,7 +252,7 @@ export class SignalingCore {
       this.joinAttempts.set(peer.clientKey, attempts);
       const code = "code" in message && typeof message.code === "string" ? message.code : "";
       const room = this.rooms.get(code);
-      if (room && room.expiresAt <= now) {
+      if (room?.expiresAt !== undefined && room.expiresAt <= now) {
         return [
           ...this.expireRoom(room),
           this.error(peerId, "ROOM_UNAVAILABLE", "接收码无效、已过期或正在使用"),
@@ -265,7 +276,7 @@ export class SignalingCore {
         {
           kind: "send",
           peerId,
-          message: { type: "join_waiting", expiresAt: room.expiresAt },
+          message: { type: "join_waiting", expiresAt: room.expiresAt! },
         },
         { kind: "send", peerId: room.senderId, message: { type: "join_requested" } },
       ];
@@ -273,7 +284,7 @@ export class SignalingCore {
 
     if (message.type === "approve_join") {
       const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
-      if (room && room.expiresAt <= this.dependencies.now()) {
+      if (room?.expiresAt !== undefined && room.expiresAt <= this.dependencies.now()) {
         return this.expireRoom(room);
       }
       if (!room || room.senderId !== peerId || !room.pendingReceiverId) {
@@ -282,6 +293,7 @@ export class SignalingCore {
       const receiverId = room.pendingReceiverId;
       room.pendingReceiverId = undefined;
       room.receiverId = receiverId;
+      room.expiresAt = undefined;
       return [
         {
           kind: "send",
@@ -319,7 +331,7 @@ export class SignalingCore {
 
     if (message.type === "signal") {
       const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
-      if (room && room.expiresAt <= this.dependencies.now()) {
+      if (room?.expiresAt !== undefined && room.expiresAt <= this.dependencies.now()) {
         return this.expireRoom(room);
       }
       const topLevelKeys = Object.keys(message);
@@ -378,6 +390,49 @@ export class SignalingCore {
           kind: "send",
           peerId: targetId,
           message: { type: "signal", signal: relaySignal },
+        },
+      ];
+    }
+
+    if (message.type === "request_relay") {
+      const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
+      if (!room?.receiverId || room.senderId !== peerId || room.relayRequested) {
+        return [this.error(peerId, "STATE_CONFLICT", "当前不能申请本地中转")];
+      }
+      room.relayRequested = true;
+      return [{ kind: "send", peerId: room.receiverId, message: { type: "relay_requested" } }];
+    }
+
+    if (message.type === "reject_relay") {
+      const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
+      if (!room?.relayRequested || room.receiverId !== peerId) {
+        return [this.error(peerId, "STATE_CONFLICT", "当前没有待确认的中转申请")];
+      }
+      room.relayRequested = false;
+      return [{ kind: "send", peerId: room.senderId, message: { type: "relay_declined" } }];
+    }
+
+    if (message.type === "approve_relay") {
+      const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
+      const nextCredential = this.dependencies.nextRelayCredential;
+      if (!room?.relayRequested || room.receiverId !== peerId || !nextCredential) {
+        return [this.error(peerId, "RELAY_UNAVAILABLE", "本地中转目前不可用")];
+      }
+      room.relayRequested = false;
+      const sessionId = nextCredential();
+      const senderToken = nextCredential();
+      const receiverToken = nextCredential();
+      return [
+        { kind: "authorize_relay", sessionId, senderToken, receiverToken },
+        {
+          kind: "send",
+          peerId: room.senderId,
+          message: { type: "relay_ready", token: senderToken, role: "sender" },
+        },
+        {
+          kind: "send",
+          peerId,
+          message: { type: "relay_ready", token: receiverToken, role: "receiver" },
         },
       ];
     }

@@ -7,11 +7,20 @@ export class PeerSession {
       options.RTCPeerConnectionImpl ?? globalThis.RTCPeerConnection;
     this.location = options.location ?? globalThis.location;
     this.onEvent = options.onEvent ?? (() => {});
+    this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval.bind(globalThis);
+    this.clearIntervalImpl = options.clearIntervalImpl ?? globalThis.clearInterval.bind(globalThis);
+    this.setTimeoutImpl = options.setTimeoutImpl ?? globalThis.setTimeout.bind(globalThis);
+    this.clearTimeoutImpl = options.clearTimeoutImpl ?? globalThis.clearTimeout.bind(globalThis);
+    this.heartbeatMs = options.heartbeatMs ?? 15_000;
     this.socket = null;
     this.peer = null;
     this.channel = null;
     this.role = null;
     this.pendingCandidates = [];
+    this.heartbeatTimer = null;
+    this.heartbeatSequence = 0;
+    this.directSlowTimer = null;
+    this.directTimeoutTimer = null;
   }
 
   connect() {
@@ -21,6 +30,7 @@ export class PeerSession {
     this.socket = new this.WebSocketImpl(`${scheme}//${this.location.host}/ws`);
     return new Promise((resolve, reject) => {
       this.socket.onopen = () => {
+        this.startHeartbeat();
         this.emit({ type: "signaling", state: "online" });
         resolve();
       };
@@ -29,6 +39,7 @@ export class PeerSession {
         reject(new Error("signaling unavailable"));
       };
       this.socket.onclose = () => {
+        this.stopHeartbeat();
         this.emit({ type: "signaling", state: "offline" });
       };
       this.socket.onmessage = (event) => {
@@ -60,7 +71,21 @@ export class PeerSession {
     this.send({ type: "reject_join" });
   }
 
+  requestRelay() {
+    this.send({ type: "request_relay" });
+  }
+
+  approveRelay() {
+    this.send({ type: "approve_relay" });
+  }
+
+  rejectRelay() {
+    this.send({ type: "reject_relay" });
+  }
+
   leave() {
+    this.stopHeartbeat();
+    this.clearDirectDeadlines();
     if (this.socket?.readyState === 1) this.send({ type: "leave" });
     this.channel?.close?.();
     this.peer?.close?.();
@@ -79,6 +104,7 @@ export class PeerSession {
     this.emit(message);
     if (message.type === "peer_joined") {
       this.role = message.role;
+      this.startDirectDeadlines();
       void this.startPeer(message.role).catch(() => {
         this.emit({ type: "error", code: "RTC_NEGOTIATION_FAILED" });
       });
@@ -88,6 +114,45 @@ export class PeerSession {
         this.emit({ type: "error", code: "RTC_NEGOTIATION_FAILED" });
       });
     }
+  }
+
+  startDirectDeadlines() {
+    this.clearDirectDeadlines();
+    this.directSlowTimer = this.setTimeoutImpl(() => {
+      this.directSlowTimer = null;
+      this.emit({ type: "direct_connection", state: "slow", elapsedMs: 8_000 });
+    }, 8_000);
+    this.directTimeoutTimer = this.setTimeoutImpl(() => {
+      this.directTimeoutTimer = null;
+      this.clearDirectDeadlines();
+      this.peer?.close?.();
+      this.emit({ type: "error", code: "DIRECT_TIMEOUT", elapsedMs: 20_000 });
+    }, 20_000);
+    this.directSlowTimer?.unref?.();
+    this.directTimeoutTimer?.unref?.();
+  }
+
+  clearDirectDeadlines() {
+    if (this.directSlowTimer !== null) this.clearTimeoutImpl(this.directSlowTimer);
+    if (this.directTimeoutTimer !== null) this.clearTimeoutImpl(this.directTimeoutTimer);
+    this.directSlowTimer = null;
+    this.directTimeoutTimer = null;
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = this.setIntervalImpl(() => {
+      if (this.socket?.readyState !== 1) return;
+      this.heartbeatSequence += 1;
+      this.send({ type: "ping", nonce: `hb-${this.heartbeatSequence}` });
+    }, this.heartbeatMs);
+    this.heartbeatTimer?.unref?.();
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer === null) return;
+    this.clearIntervalImpl(this.heartbeatTimer);
+    this.heartbeatTimer = null;
   }
 
   async startPeer(role) {
@@ -171,6 +236,7 @@ export class PeerSession {
     this.channel = channel;
     channel.binaryType = "arraybuffer";
     channel.onopen = () => {
+      this.clearDirectDeadlines();
       this.emit({ type: "data_channel", state: "open", channel });
       void this.inspectDirectPath().catch(() => {
         this.emit({ type: "direct_path", direct: false, reason: "stats_unavailable" });

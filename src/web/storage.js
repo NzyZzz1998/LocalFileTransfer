@@ -26,6 +26,34 @@ function requireLimit(value) {
   }
 }
 
+export async function assessStorageCapability(
+  files,
+  navigatorRef = globalThis.navigator,
+  limitBytes = DEFAULT_MEMORY_LIMIT_BYTES,
+) {
+  requireLimit(limitBytes);
+  if (typeof navigatorRef?.storage?.getDirectory === "function") {
+    try {
+      await navigatorRef.storage.getDirectory();
+      return { mode: "opfs", allowed: true, limitBytes: null };
+    } catch {
+      // A present API can still be unavailable on a non-secure LAN origin.
+    }
+  }
+  let total = 0;
+  for (const file of files) {
+    requireSize(file?.size);
+    if (file.size > limitBytes) {
+      return { mode: "memory", allowed: false, limitBytes, code: "FILE_TOO_LARGE" };
+    }
+    total += file.size;
+    if (!Number.isSafeInteger(total) || total > limitBytes) {
+      return { mode: "memory", allowed: false, limitBytes, code: "BATCH_TOO_LARGE" };
+    }
+  }
+  return { mode: "memory", allowed: true, limitBytes };
+}
+
 export class MemorySink {
   constructor({ expectedSize, maxBytes = DEFAULT_MEMORY_LIMIT_BYTES, type = "" }) {
     requireSize(expectedSize);

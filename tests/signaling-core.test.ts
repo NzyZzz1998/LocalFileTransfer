@@ -14,6 +14,10 @@ function makeCore(codes: string[] = ["583204"]) {
     {
       now: () => now,
       nextRoomCode: () => codes[index++] ?? "999999",
+      nextRelayCredential: (() => {
+        const values = ["relay-session", "sender-token", "receiver-token"];
+        return () => values.shift() ?? "extra-token";
+      })(),
     },
   );
 
@@ -27,6 +31,36 @@ function makeCore(codes: string[] = ["583204"]) {
 
 
 describe("SignalingCore rooms", () => {
+  test("requires sender request and receiver approval before authorizing a relay", () => {
+    const { core } = makeCore();
+    core.connect({ id: "sender", clientKey: "10.0.0.1" });
+    core.connect({ id: "receiver", clientKey: "10.0.0.2" });
+    core.receive("sender", JSON.stringify({ type: "create_room" }));
+    core.receive("receiver", JSON.stringify({ type: "join_room", code: "583204" }));
+    core.receive("sender", JSON.stringify({ type: "approve_join" }));
+
+    expect(core.receive("sender", JSON.stringify({ type: "request_relay" }))).toEqual([
+      { kind: "send", peerId: "receiver", message: { type: "relay_requested" } },
+    ]);
+    expect(core.receive("receiver", JSON.stringify({ type: "approve_relay" }))).toEqual([
+      {
+        kind: "authorize_relay",
+        sessionId: "relay-session",
+        senderToken: "sender-token",
+        receiverToken: "receiver-token",
+      },
+      {
+        kind: "send",
+        peerId: "sender",
+        message: { type: "relay_ready", token: "sender-token", role: "sender" },
+      },
+      {
+        kind: "send",
+        peerId: "receiver",
+        message: { type: "relay_ready", token: "receiver-token", role: "receiver" },
+      },
+    ]);
+  });
   test("create_room returns a six-digit room code with a fixed expiry", () => {
     const { core } = makeCore();
     core.connect({ id: "sender", clientKey: "192.168.1.2" });
@@ -338,7 +372,7 @@ describe("SignalingCore rooms", () => {
     });
   });
 
-  test("signal at the expiry boundary expires the paired room without relaying", () => {
+  test("a paired room is no longer expired by its pre-pairing creation TTL", () => {
     const { core, advance } = makeCore(["583204", "583205", "583206"]);
     core.connect({ id: "sender", clientKey: "10.0.0.1" });
     core.connect({ id: "receiver", clientKey: "10.0.0.2" });
@@ -356,15 +390,18 @@ describe("SignalingCore rooms", () => {
     );
 
     expect(relay).toEqual([
-      { kind: "send", peerId: "sender", message: { type: "room_expired" } },
-      { kind: "send", peerId: "receiver", message: { type: "room_expired" } },
+      {
+        kind: "send",
+        peerId: "receiver",
+        message: {
+          type: "signal",
+          signal: { type: "offer", sdp: "must-not-be-forwarded" },
+        },
+      },
     ]);
     expect(core.sweepExpiredRooms()).toEqual([]);
     expect(core.receive("sender", JSON.stringify({ type: "create_room" }))[0]).toMatchObject({
-      message: { code: "583205" },
-    });
-    expect(core.receive("receiver", JSON.stringify({ type: "create_room" }))[0]).toMatchObject({
-      message: { code: "583206" },
+      message: { code: "ALREADY_IN_ROOM" },
     });
   });
 

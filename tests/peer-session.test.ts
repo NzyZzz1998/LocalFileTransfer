@@ -116,6 +116,87 @@ class FakePeerConnection {
 }
 
 describe("PeerSession signaling", () => {
+  test("reports a slow direct route at 8 seconds and fails it at 20 seconds", async () => {
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const timers = new Map<number, () => void>();
+    const events: any[] = [];
+    const session = new PeerSession({
+      WebSocketImpl: FakeWebSocket,
+      RTCPeerConnectionImpl: FakePeerConnection,
+      location: { protocol: "http:", host: "127.0.0.1:3210" },
+      onEvent: (event: unknown) => events.push(event),
+      setTimeoutImpl: (callback: () => void, delay: number) => {
+        timers.set(delay, callback);
+        return delay;
+      },
+      clearTimeoutImpl: (token: number) => timers.delete(token),
+    });
+    const connected = session.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    await connected;
+    socket.receive({ type: "peer_joined", role: "sender" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    timers.get(8_000)?.();
+    expect(events).toContainEqual({ type: "direct_connection", state: "slow", elapsedMs: 8_000 });
+    timers.get(20_000)?.();
+    expect(events).toContainEqual({ type: "error", code: "DIRECT_TIMEOUT", elapsedMs: 20_000 });
+    expect(FakePeerConnection.instances[0].connectionState).toBe("closed");
+  });
+
+  test("opening the data channel cancels both direct connection deadlines", async () => {
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const cleared: number[] = [];
+    const session = new PeerSession({
+      WebSocketImpl: FakeWebSocket,
+      RTCPeerConnectionImpl: FakePeerConnection,
+      location: { protocol: "http:", host: "127.0.0.1:3210" },
+      setTimeoutImpl: (_callback: () => void, delay: number) => delay,
+      clearTimeoutImpl: (token: number) => cleared.push(token),
+    });
+    const connected = session.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    await connected;
+    socket.receive({ type: "peer_joined", role: "sender" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    FakePeerConnection.instances[0].channel?.onopen?.();
+
+    expect(cleared).toEqual([8_000, 20_000]);
+  });
+
+  test("keeps signaling alive with a bounded heartbeat and clears it on leave", async () => {
+    FakeWebSocket.instances = [];
+    let tick: (() => void) | null = null;
+    let cleared: unknown = null;
+    const timerToken = { id: "heartbeat" };
+    const session = new PeerSession({
+      WebSocketImpl: FakeWebSocket,
+      location: { protocol: "http:", host: "127.0.0.1:3210" },
+      setIntervalImpl: (callback: () => void, delay: number) => {
+        expect(delay).toBe(15_000);
+        tick = callback;
+        return timerToken;
+      },
+      clearIntervalImpl: (token: unknown) => {
+        cleared = token;
+      },
+    });
+
+    const connected = session.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    await connected;
+    tick?.();
+
+    expect(socket.sent).toEqual([JSON.stringify({ type: "ping", nonce: "hb-1" })]);
+    session.leave();
+    expect(cleared).toBe(timerToken);
+  });
+
   test("connects to the same-origin websocket and creates a room", async () => {
     FakeWebSocket.instances = [];
     const events: unknown[] = [];

@@ -129,6 +129,25 @@ function flatten(chunks: Uint8Array[]): Uint8Array {
 
 
 describe("browser transfer protocol", () => {
+  test("derives speed and ETA from acknowledged bytes with a two-second window", async () => {
+    const { TransferMetrics } = await import("../src/web/transfer.js");
+    let now = 0;
+    const metrics = new TransferMetrics(() => now);
+    metrics.update(0, 4_000_000);
+    now = 1_000;
+    const first = metrics.update(1_000_000, 4_000_000);
+    expect(first).toEqual({
+      currentBytesPerSecond: 1_000_000,
+      averageBytesPerSecond: 1_000_000,
+      elapsedMs: 1_000,
+      etaMs: 3_000,
+    });
+    now = 3_000;
+    const second = metrics.update(3_000_000, 4_000_000);
+    expect(second.currentBytesPerSecond).toBe(1_000_000);
+    expect(second.averageBytesPerSecond).toBe(1_000_000);
+    expect(second.etaMs).toBe(1_000);
+  });
   test("configures the receiving channel to deliver binary chunks as ArrayBuffer", async () => {
     const { ReceiverEngine } = await import("../src/web/transfer.js");
     const channel = new FakeChannel();
@@ -368,7 +387,7 @@ describe("browser transfer protocol", () => {
 
     expect(senderStates).toEqual(["awaiting_acceptance", "transferring", "completed"]);
     expect(receiverStates).toEqual(["awaiting_acceptance", "receiving", "completed"]);
-    expect(senderProgress.map((progress) => progress.fileBytes)).toEqual([0, 16_384, 16_385]);
+    expect(senderProgress.map((progress) => progress.fileBytes)).toEqual([0, 16_385]);
     expect(receiverProgress.map((progress) => progress.fileBytes)).toEqual([0, 16_384, 16_385]);
     expect(senderProgress.at(-1)).toMatchObject({
       file: expect.objectContaining({ name: "progress.bin" }),
@@ -386,6 +405,48 @@ describe("browser transfer protocol", () => {
       overallBytes: 16_385,
       totalBytes: 16_385,
     });
+  });
+
+  test("sender progress advances only when the receiver acknowledges stored bytes", async () => {
+    const { SenderEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const progress: Array<Record<string, any>> = [];
+    const sender = new SenderEngine(channel, { onProgress: (event: any) => progress.push(event) });
+    sender.send([new File([new Uint8Array(16_385)], "ack.bin")]);
+    const offer = controlMessages(channel).find((message) => message.type === "offer_manifest")!;
+    deliverProtocolControl(channel, { type: "accept_manifest", transferId: offer.transferId });
+    await waitUntil(() => binaryMessages(channel).length === 2, "file chunks were not queued");
+
+    expect(progress.map((event) => event.overallBytes)).toEqual([0]);
+    deliverProtocolControl(channel, {
+      type: "transfer_ack",
+      transferId: offer.transferId,
+      fileId: "file-0",
+      receivedBytes: 16_384,
+      overallBytes: 16_384,
+    });
+    expect(progress.at(-1)?.overallBytes).toBe(16_384);
+    sender.cancel();
+  });
+
+  test("rejects an acknowledgement beyond the bytes already sent", async () => {
+    const { SenderEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const sender = new SenderEngine(channel);
+    const result = sender.send([new File([Uint8Array.from([1])], "ack.bin")]);
+    const offer = controlMessages(channel).find((message) => message.type === "offer_manifest")!;
+    deliverProtocolControl(channel, { type: "accept_manifest", transferId: offer.transferId });
+    await waitUntil(() => binaryMessages(channel).length === 1, "file chunk was not queued");
+    deliverProtocolControl(channel, {
+      type: "transfer_ack",
+      transferId: offer.transferId,
+      fileId: "file-0",
+      receivedBytes: 2,
+      overallBytes: 2,
+    });
+
+    await expect(result).rejects.toThrow("invalid receiver acknowledgement");
+    expect(sender.state).toBe("failed");
   });
 
   test("does not complete the sender until the receiver confirms the whole transfer", async () => {

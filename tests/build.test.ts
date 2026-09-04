@@ -47,6 +47,9 @@ describe("distribution build", () => {
         ["/peer-session.js", "src/web/peer-session.js"],
         ["/transfer.js", "src/web/transfer.js"],
         ["/storage.js", "src/web/storage.js"],
+        ["/relay-crypto.js", "src/web/relay-crypto.js"],
+        ["/relay-transport.js", "src/web/relay-transport.js"],
+        ["/vendor/tweetnacl.js", "node_modules/tweetnacl/nacl-fast.min.js"],
       ]) {
         const response = await fetch(new URL(route, baseUrl));
         expect(response.status).toBe(200);

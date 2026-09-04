@@ -1,6 +1,40 @@
 import { describe, expect, test } from "bun:test";
 
-import { MemorySink, createStorage } from "../src/web/storage.js";
+import { MemorySink, assessStorageCapability, createStorage } from "../src/web/storage.js";
+
+describe("storage capability preflight", () => {
+  test("blocks a memory-only batch whose aggregate size exceeds 256 MiB", async () => {
+    const result = await assessStorageCapability(
+      [
+        { name: "first.bin", size: 200 * 1024 * 1024 },
+        { name: "second.bin", size: 57 * 1024 * 1024 },
+      ],
+      {},
+    );
+    expect(result).toEqual({
+      mode: "memory",
+      allowed: false,
+      limitBytes: 256 * 1024 * 1024,
+      code: "BATCH_TOO_LARGE",
+    });
+  });
+
+  test("blocks an oversized memory file before receiving bytes", async () => {
+    const result = await assessStorageCapability(
+      [{ name: "large.bin", size: 256 * 1024 * 1024 + 1 }],
+      {},
+    );
+    expect(result).toMatchObject({ mode: "memory", allowed: false, code: "FILE_TOO_LARGE" });
+  });
+
+  test("allows a large manifest when OPFS can actually be opened", async () => {
+    const result = await assessStorageCapability(
+      [{ name: "large.bin", size: 300 * 1024 * 1024 }],
+      { storage: { getDirectory: async () => ({}) } },
+    );
+    expect(result).toEqual({ mode: "opfs", allowed: true, limitBytes: null });
+  });
+});
 
 function createFakeOpfs() {
   const chunks: Uint8Array[] = [];

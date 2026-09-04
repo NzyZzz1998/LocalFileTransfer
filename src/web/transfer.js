@@ -2,8 +2,41 @@ export const TRANSFER_PROTOCOL_VERSION = 1;
 export const TRANSFER_CHUNK_BYTES = 16 * 1024;
 const DEFAULT_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DEFAULT_LOW_WATER_MARK = 1024 * 1024;
+const ACK_INTERVAL_BYTES = 256 * 1024;
 
 let nextTransferNumber = 1;
+
+export class TransferMetrics {
+  constructor(now = () => performance.now()) {
+    this.now = now;
+    this.startedAt = null;
+    this.samples = [];
+    this.lastBytes = 0;
+  }
+
+  update(bytes, totalBytes) {
+    const at = this.now();
+    if (this.startedAt === null || bytes < this.lastBytes) {
+      this.startedAt = at;
+      this.samples = [{ at, bytes }];
+    } else {
+      this.samples.push({ at, bytes });
+    }
+    this.lastBytes = bytes;
+    const cutoff = at - 2_000;
+    while (this.samples.length > 2 && this.samples[1].at <= cutoff) this.samples.shift();
+    const first = this.samples[0];
+    const windowMs = at - first.at;
+    const elapsedMs = at - this.startedAt;
+    const currentBytesPerSecond = windowMs > 0 ? ((bytes - first.bytes) * 1_000) / windowMs : 0;
+    const averageBytesPerSecond = elapsedMs > 0 ? (bytes * 1_000) / elapsedMs : 0;
+    const etaMs =
+      elapsedMs >= 1_000 && averageBytesPerSecond > 0
+        ? ((Math.max(0, totalBytes - bytes) / averageBytesPerSecond) * 1_000)
+        : null;
+    return { currentBytesPerSecond, averageBytesPerSecond, elapsedMs, etaMs };
+  }
+}
 
 function sendControl(channel, message) {
   channel.send(JSON.stringify({ v: TRANSFER_PROTOCOL_VERSION, ...message }));
@@ -127,6 +160,8 @@ export class SenderEngine {
       this.rejectResult = reject;
     });
     this.transferCompleted = deferred();
+    this.sentOverallBytes = 0;
+    this.acknowledgedOverallBytes = 0;
 
     sendControl(this.channel, {
       type: "offer_manifest",
@@ -168,6 +203,30 @@ export class SenderEngine {
       return;
     }
 
+    if (message?.type === "transfer_ack" && message.transferId === this.transferId) {
+      const valid =
+        this.state === "transferring" &&
+        message.fileId === `file-${this.currentFileIndex}` &&
+        Number.isSafeInteger(message.receivedBytes) &&
+        Number.isSafeInteger(message.overallBytes) &&
+        message.receivedBytes >= 0 &&
+        message.overallBytes >= this.acknowledgedOverallBytes &&
+        message.overallBytes <= this.sentOverallBytes &&
+        message.overallBytes === this.completedFileBytes + message.receivedBytes;
+      if (!valid) {
+        this.fail(new TransferProtocolError("INVALID_ACK", "invalid receiver acknowledgement"));
+        return;
+      }
+      this.acknowledgedOverallBytes = message.overallBytes;
+      this.reportProgress(
+        this.manifestFiles[this.currentFileIndex],
+        this.currentFileIndex,
+        message.receivedBytes,
+        message.overallBytes,
+      );
+      return;
+    }
+
     if (message?.type === "transfer_complete" && message.transferId === this.transferId) {
       this.transferCompleted.resolve(message);
       return;
@@ -185,6 +244,8 @@ export class SenderEngine {
       const file = this.files[index];
       const fileMetadata = this.manifestFiles[index];
       const fileId = `file-${index}`;
+      this.currentFileIndex = index;
+      this.completedFileBytes = totalBytes;
       this.fileReceived = deferred();
       this.reportProgress(fileMetadata, index, 0, totalBytes);
       sendControl(this.channel, {
@@ -203,7 +264,7 @@ export class SenderEngine {
         if (this.state !== "transferring") return;
         this.channel.send(chunk);
         const fileBytes = Math.min(file.size, offset + chunk.byteLength);
-        this.reportProgress(fileMetadata, index, fileBytes, totalBytes + fileBytes);
+        this.sentOverallBytes = totalBytes + fileBytes;
       }
 
       if (this.state !== "transferring") return;
@@ -221,6 +282,7 @@ export class SenderEngine {
         throw new Error("receiver byte count did not match the file");
       }
       totalBytes += file.size;
+      this.acknowledgedOverallBytes = totalBytes;
     }
     await this.transferCompleted.promise;
     if (this.state !== "transferring") return;
@@ -352,12 +414,16 @@ export class ReceiverEngine {
       const chunk = new Uint8Array(data);
       await this.currentFile.sink.write(chunk);
       this.currentFile.receivedBytes += chunk.byteLength;
+      const overallBytes = this.completedBytes() + this.currentFile.receivedBytes;
       this.reportProgress(
         this.currentFile.file,
         this.nextFileIndex,
         this.currentFile.receivedBytes,
-        this.completedBytes() + this.currentFile.receivedBytes,
+        overallBytes,
       );
+      if (overallBytes - (this.lastAcknowledgedBytes ?? 0) >= ACK_INTERVAL_BYTES) {
+        this.sendAcknowledgement(overallBytes);
+      }
       return;
     }
 
@@ -429,6 +495,8 @@ export class ReceiverEngine {
       }
 
       const result = await current.sink.finalize();
+      const finalOverallBytes = this.completedBytes() + current.receivedBytes;
+      this.sendAcknowledgement(finalOverallBytes, current);
       this.receivedFiles.push({ file: current.file, result, sink: current.sink });
       this.currentFile = undefined;
       sendControl(this.channel, {
@@ -452,6 +520,18 @@ export class ReceiverEngine {
     return this.receivedFiles.reduce((total, entry) => total + entry.file.size, 0);
   }
 
+  sendAcknowledgement(overallBytes, current = this.currentFile) {
+    if (!current || overallBytes === this.lastAcknowledgedBytes) return;
+    sendControl(this.channel, {
+      type: "transfer_ack",
+      transferId: this.manifest.transferId,
+      fileId: current.file.id,
+      receivedBytes: current.receivedBytes,
+      overallBytes,
+    });
+    this.lastAcknowledgedBytes = overallBytes;
+  }
+
   reportProgress(file, index, fileBytes, overallBytes) {
     this.onProgress({
       file,
@@ -473,6 +553,7 @@ export class ReceiverEngine {
       throw new Error("there is no manifest to accept");
     }
     this.setState("receiving");
+    this.lastAcknowledgedBytes = 0;
     sendControl(this.channel, {
       type: "accept_manifest",
       transferId: this.manifest.transferId,

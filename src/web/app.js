@@ -21,6 +21,8 @@
   let receiverEngine = null;
   let directChannel = null;
   let roomActive = false;
+  const metricsByPrefix = new Map();
+  const lastProgressPaint = new Map();
   let isCleaningUp = false;
   let unloadCleanupStarted = false;
   const objectUrls = new Set();
@@ -51,6 +53,7 @@
     showOnly(stage, [
       byId("receiver-code-stage"),
       byId("receiver-searching"),
+      byId("receiver-relay-consent"),
       byId("receiver-offer"),
       byId("receiver-progress"),
       byId("receiver-complete"),
@@ -165,22 +168,28 @@
       return `尝试次数过多，请在 ${seconds} 秒后重试`;
     }
     if (event.code === "RTC_NEGOTIATION_FAILED") return "无法建立局域网直连";
+    if (event.code === "DIRECT_TIMEOUT") return "20 秒内未能建立局域网直连";
+    if (event.code === "RELAY_UNAVAILABLE") return "本地中转目前不可用";
     if (event.code === "INVALID_SERVER_MESSAGE") return "配对站返回了无法识别的信息";
     return "这次传输的状态已经变化，请返回后重试";
   }
 
   async function loadRealModules() {
     if (!realModules) {
-      const [peerModule, transferModule, storageModule] = await Promise.all([
+      const [peerModule, transferModule, storageModule, relayModule] = await Promise.all([
         import("./peer-session.js"),
         import("./transfer.js"),
         import("./storage.js"),
+        import("./relay-transport.js"),
       ]);
       realModules = {
         PeerSession: peerModule.PeerSession,
         SenderEngine: transferModule.SenderEngine,
         ReceiverEngine: transferModule.ReceiverEngine,
+        TransferMetrics: transferModule.TransferMetrics,
         createStorage: storageModule.createStorage,
+        assessStorageCapability: storageModule.assessStorageCapability,
+        RelayTransport: relayModule.RelayTransport,
       };
     }
     return realModules;
@@ -338,12 +347,22 @@
   function approveDemoPeer() {
     byId("join-request").hidden = true;
     byId("sender-connected").hidden = false;
-    byId("sender-route-fact").textContent = "局域网直连";
-    byId("sender-encryption-fact").textContent = "已建立";
-    announce("连接已允许，等待对方确认文件");
+    byId("sender-connected").querySelector("strong").textContent = "正在建立局域网直连…";
+    byId("sender-connected").querySelector("small").textContent = "连接较慢时会在 20 秒停止并给出出口";
+    byId("sender-route-timeline").hidden = false;
+    byId("sender-route-fact").textContent = "正在寻找直连";
+    byId("sender-encryption-fact").textContent = "尚未建立";
+    announce("正在寻找局域网直连");
+    demoTimer = setTimeout(() => {
+      byId("sender-connected").hidden = true;
+      byId("sender-route-timeline").hidden = true;
+      byId("sender-route-failed").hidden = false;
+      byId("sender-route-fact").textContent = "直连超时 · 未改路";
+      announce("直连没有建立，可以重试或申请本地中转");
+    }, 650);
   }
 
-  function renderReceiverManifest(manifest) {
+  async function renderReceiverManifest(manifest) {
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     const list = byId("receiver-file-list");
     list.replaceChildren(...files.map((file) => createFileRow(file)));
@@ -351,20 +370,42 @@
     byId("receiver-summary").textContent = `${files.length} 个文件 · ${formatBytes(total)}`;
     byId("receiver-title").textContent = "核对这批文件";
     showReceiverStage(byId("receiver-offer"));
+    const acceptButton = byId("accept-files-button");
+    const contract = document.querySelector(".storage-contract");
+    acceptButton.disabled = true;
+    contract.textContent = "正在检查这台浏览器的接收能力…";
+    const capability = isDemo
+      ? { mode: "memory", allowed: true, limitBytes: MAX_MEMORY_BYTES }
+      : await realModules.assessStorageCapability(files, navigator, MAX_MEMORY_BYTES);
+    if (!capability.allowed) {
+      contract.innerHTML = `<b>无法接收这批文件</b>${capability.code === "FILE_TOO_LARGE" ? "存在超过 256 MiB 的文件" : "本批文件总量超过 256 MiB"}；当前浏览器只能使用内存接收。`;
+      showError("receiver", "容量预检未通过，尚未接收任何文件内容");
+    } else {
+      contract.innerHTML = capability.mode === "opfs"
+        ? "<b>浏览器存储模式</b>本批将写入浏览器临时文件，完成后仍需手动保存。"
+        : "<b>内存接收模式</b>单个文件与本批总量上限均为 256 MiB；本批已通过容量预检。";
+      acceptButton.disabled = false;
+    }
     announce("收到一份文件清单，请确认");
   }
 
   function renderDemoOffer() {
-    renderReceiverManifest({ files: [{ name: "设计素材包.zip", size: 18.4 * 1024 * 1024 }] });
-    byId("receiver-route-fact").textContent = "局域网直连";
-    byId("receiver-encryption-fact").textContent = "已建立";
+    void renderReceiverManifest({ files: [{ name: "设计素材包.zip", size: 18.4 * 1024 * 1024 }] });
+    byId("receiver-route-fact").textContent = "本地中转";
+    byId("receiver-encryption-fact").textContent = "应用层加密";
+    byId("receiver-connection-status").textContent = "本地中转";
   }
 
   function connectDemoReceiver() {
     showReceiverStage(byId("receiver-searching"));
     byId("receiver-title").textContent = "等待发送方允许连接";
     announce("正在查找传输");
-    demoTimer = setTimeout(renderDemoOffer, 600);
+    demoTimer = setTimeout(() => {
+      showReceiverStage(byId("receiver-relay-consent"));
+      byId("receiver-title").textContent = "确认是否改走本地中转";
+      byId("receiver-route-fact").textContent = "等待你确认改路";
+      announce("发送方请求改用本地中转");
+    }, 600);
   }
 
   function renderReceivedFiles(entries) {
@@ -412,6 +453,15 @@
   }
 
   function updateProgress(prefix, progress) {
+    let metrics = metricsByPrefix.get(prefix);
+    if (!metrics || progress.overallBytes === 0) {
+      metrics = new realModules.TransferMetrics();
+      metricsByPrefix.set(prefix, metrics);
+    }
+    const measurement = metrics.update(progress.overallBytes, progress.totalBytes);
+    const now = performance.now();
+    if (progress.overallBytes < progress.totalBytes && now - (lastProgressPaint.get(prefix) ?? -Infinity) < 250) return;
+    lastProgressPaint.set(prefix, now);
     const percent = progress.totalBytes === 0 ? 100 : Math.round((progress.overallBytes / progress.totalBytes) * 100);
     const output = byId(prefix === "sender" ? "sender-progress-percent" : "progress-percent");
     const fill = byId(prefix === "sender" ? "sender-waterline-fill" : "waterline-fill");
@@ -423,13 +473,23 @@
     fill.parentElement.setAttribute("aria-valuenow", String(percent));
     file.textContent = progress.file.name;
     bytes.textContent = `${formatBytes(progress.overallBytes)} / ${formatBytes(progress.totalBytes)}`;
+    const speed = byId(prefix === "sender" ? "sender-current-speed" : "receiver-current-speed");
+    const averageEta = byId(prefix === "sender" ? "sender-average-eta" : "receiver-average-eta");
+    const elapsed = byId(prefix === "sender" ? "sender-elapsed" : "receiver-elapsed");
+    speed.textContent = measurement.currentBytesPerSecond > 0
+      ? `${formatBytes(measurement.currentBytesPerSecond)}/s`
+      : "计算中";
+    averageEta.textContent = measurement.averageBytesPerSecond > 0
+      ? `${formatBytes(measurement.averageBytesPerSecond)}/s / ${measurement.etaMs === null ? "计算中" : `${Math.ceil(measurement.etaMs / 1_000)} 秒`}`
+      : "— / —";
+    elapsed.textContent = `${Math.floor(measurement.elapsedMs / 1_000)} 秒`;
   }
 
   function setupReceiver(channel) {
     if (receiverEngine) return;
     receiverEngine = new realModules.ReceiverEngine(channel, {
       createSink: (file) => realModules.createStorage({ ...file, maxMemoryBytes: MAX_MEMORY_BYTES, navigator }),
-      onManifest: renderReceiverManifest,
+      onManifest: (manifest) => void renderReceiverManifest(manifest),
       onProgress: (progress) => updateProgress("receiver", progress),
       onState: (state) => {
         if (state === "receiving") {
@@ -569,6 +629,16 @@
       }
       return;
     }
+    if (event.type === "direct_connection" && event.state === "slow") {
+      if (sessionRole === "sender") {
+        byId("sender-route-timeline").hidden = false;
+        byId("sender-connected").querySelector("small").textContent = "连接比平时慢，最多等待 20 秒";
+      } else {
+        byId("receiver-searching").querySelector("p:last-child").textContent = "连接比平时慢，最多等待 20 秒";
+      }
+      announce("连接比平时慢，仍在寻找局域网路线");
+      return;
+    }
     if (event.type === "data_channel" && event.state === "open") {
       directChannel = event.channel;
       if (sessionRole === "receiver") setupReceiver(event.channel);
@@ -580,15 +650,42 @@
     }
     if (event.type === "peer_connection") {
       if (event.state === "failed" || event.state === "closed") {
-        stopAfterConnectionFailure("局域网直连已中断，本次传输无法继续");
+        if (directChannel) stopAfterConnectionFailure("局域网直连已中断，本次传输无法继续");
+        else if (sessionRole === "sender") {
+          byId("sender-connected").hidden = true;
+          byId("sender-route-timeline").hidden = true;
+          byId("sender-route-failed").hidden = false;
+        }
       } else if (event.state === "disconnected" && hasActiveWork()) {
         announce("局域网连接暂时中断，正在尝试恢复");
       }
       return;
     }
+    if (event.type === "relay_requested") {
+      showReceiverStage(byId("receiver-relay-consent"));
+      byId("receiver-title").textContent = "确认是否改走本地中转";
+      byId("receiver-route-fact").textContent = "等待你确认改路";
+      announce("发送方请求改用本地中转");
+      return;
+    }
+    if (event.type === "relay_declined") {
+      byId("sender-relay-pending").hidden = true;
+      byId("sender-route-failed").hidden = false;
+      showError("sender", "接收方拒绝了本地中转，本次仍未发送文件内容");
+      return;
+    }
+    if (event.type === "relay_ready") {
+      void openRelayTransport(event);
+      return;
+    }
     if (event.type === "direct_path") {
       if (!event.direct) {
-        stopAfterConnectionFailure("无法建立局域网直连；不会改走服务器中转");
+        if (sessionRole === "sender") {
+          byId("sender-connected").hidden = true;
+          byId("sender-route-failed").hidden = false;
+          byId("sender-route-fact").textContent = "直连路线未通过验证";
+        }
+        announce("直连路线未通过验证，尚未发送文件内容");
         return;
       }
       const routeFact = byId(sessionRole === "sender" ? "sender-route-fact" : "receiver-route-fact");
@@ -608,7 +705,16 @@
     }
     if (event.type === "error") {
       const message = errorMessage(event);
-      if (event.code === "RTC_NEGOTIATION_FAILED") {
+      if (event.code === "DIRECT_TIMEOUT" && sessionRole === "sender") {
+        byId("sender-connected").hidden = true;
+        byId("sender-route-timeline").hidden = true;
+        byId("sender-route-failed").hidden = false;
+        byId("sender-route-fact").textContent = "直连超时 · 未改路";
+        announce("直连超时，尚未发送文件；可以重试或申请本地中转");
+      } else if (event.code === "DIRECT_TIMEOUT" && sessionRole === "receiver") {
+        byId("receiver-searching").querySelector("h3").textContent = "直连未成功";
+        byId("receiver-searching").querySelector("p:last-child").textContent = "等待发送方重试或申请本地中转";
+      } else if (event.code === "RTC_NEGOTIATION_FAILED") {
         stopAfterConnectionFailure(message);
       } else {
         if (
@@ -620,6 +726,30 @@
         }
         showError(sessionRole, message);
       }
+    }
+  }
+
+  async function openRelayTransport(event) {
+    try {
+      const modules = await loadRealModules();
+      const transport = new modules.RelayTransport({ token: event.token });
+      await transport.connect();
+      directChannel = transport;
+      if (sessionRole === "sender") {
+        byId("sender-relay-pending").hidden = true;
+        byId("sender-route-fact").textContent = "本地中转";
+        byId("sender-encryption-fact").textContent = "应用层加密";
+        byId("sender-relay-fact").textContent = "双方已确认";
+        setupSender(transport);
+      } else {
+        byId("receiver-route-fact").textContent = "本地中转";
+        byId("receiver-encryption-fact").textContent = "应用层加密";
+        byId("receiver-connection-status").textContent = "本地中转";
+        setupReceiver(transport);
+      }
+      announce("本地中转加密通道已建立");
+    } catch {
+      showError(sessionRole, "本地中转加密通道建立失败");
     }
   }
 
@@ -660,6 +790,8 @@
       progress = Math.min(100, progress + 20);
       byId("progress-percent").textContent = `${progress}%`;
       byId("progress-bytes").textContent = `${formatBytes((18.4 * 1024 * 1024 * progress) / 100)} / 18.4 MB`;
+      byId("receiver-current-speed").textContent = progress < 20 ? "计算中" : "31.6 MB/s";
+      byId("receiver-average-eta").textContent = progress < 20 ? "— / —" : `28.9 MB/s / ${Math.max(0, Math.ceil((100 - progress) / 40))} 秒`;
       byId("waterline-fill").style.width = `${progress}%`;
       byId("waterline-fill").nextElementSibling.style.left = `${progress}%`;
       byId("waterline-fill").parentElement.setAttribute("aria-valuenow", String(progress));
@@ -741,6 +873,46 @@
     }
   });
 
+  byId("use-relay-button").addEventListener("click", () => {
+    byId("sender-route-failed").hidden = true;
+    byId("sender-relay-pending").hidden = false;
+    byId("sender-route-fact").textContent = "本地中转 · 等待确认";
+    byId("sender-relay-fact").textContent = "接收方确认中";
+    announce("已申请本地中转，等待接收方同意");
+    if (!isDemo) session?.requestRelay();
+  });
+
+  byId("retry-direct-button").addEventListener("click", () => {
+    byId("sender-route-failed").hidden = true;
+    if (isDemo) {
+      byId("sender-connected").hidden = false;
+      byId("sender-route-timeline").hidden = false;
+      announce("已重新开始寻找局域网直连");
+      return;
+    }
+    void releaseSession({ graceMs: 0 })
+      .then(() => ensureSession("sender"))
+      .then((activeSession) => activeSession.createRoom())
+      .catch(() => showError("sender", "重试失败，暂时连接不上配对站"));
+  });
+
+  byId("copy-diagnostic-button").addEventListener("click", async () => {
+    const diagnostic = JSON.stringify({
+      version: "0.2.0",
+      error: "DIRECT_TIMEOUT",
+      stage: "direct_connecting",
+      elapsedMs: 20_000,
+      signaling: "online_before_timeout",
+    }, null, 2);
+    try {
+      await navigator.clipboard.writeText(diagnostic);
+      byId("copy-diagnostic-button").textContent = "诊断已复制";
+      announce("已复制不含房间码、IP 和文件名的诊断信息");
+    } catch {
+      announce("无法自动复制诊断，请检查浏览器剪贴板权限");
+    }
+  });
+
   byId("approve-peer-button").addEventListener("click", () => {
     if (isDemo) approveDemoPeer();
     else session?.approveJoin();
@@ -778,6 +950,18 @@
     }
   });
 
+  byId("approve-relay-button").addEventListener("click", () => {
+    if (isDemo) renderDemoOffer();
+    else session?.approveRelay();
+  });
+  byId("reject-relay-button").addEventListener("click", () => {
+    if (isDemo) void resetHome();
+    else {
+      session?.rejectRelay();
+      void resetHome();
+    }
+  });
+
   byId("accept-files-button").addEventListener("click", () => {
     if (isDemo) startDemoReceive();
     else if (receiverEngine?.state === "awaiting_acceptance") receiverEngine.accept();
@@ -794,6 +978,67 @@
   addEventListener("pagehide", bestEffortPageExitCleanup);
   addEventListener("beforeunload", bestEffortPageExitCleanup);
 
+  async function initializeLanAccess() {
+    const output = byId("lan-url");
+    const button = byId("copy-lan-url");
+    let url = isDemo ? "http://192.168.31.73:3000" : "";
+    let canShutdown = false;
+    if (!isDemo) {
+      try {
+        const response = await fetch("/api/runtime", { cache: "no-store" });
+        if (response.ok) {
+          const runtime = await response.json();
+          url = runtime.recommendedUrl ?? "";
+          canShutdown = runtime.canShutdown === true;
+        }
+      } catch {
+        // Runtime endpoint is delivered in the implementation batch; localhost remains usable meanwhile.
+      }
+    }
+    if (!url && location.protocol !== "file:") url = location.origin;
+    if (!url) {
+      output.textContent = "暂未找到可访问的局域网地址";
+      return;
+    }
+    output.textContent = url;
+    button.disabled = false;
+    byId("shutdown-service-button").hidden = !canShutdown;
+    button.addEventListener("click", async () => {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+        await navigator.clipboard.writeText(url);
+        button.textContent = "已复制";
+      } catch {
+        output.setAttribute("tabindex", "0");
+        output.focus();
+        announce("无法自动复制，请手动复制地址");
+      }
+    });
+  }
+
+  byId("shutdown-service-button").addEventListener("click", async () => {
+    const warning = hasActiveWork()
+      ? "当前还有房间或传输，关闭会立即断开另一台电脑。确定关闭整个渡口吗？"
+      : "关闭后其他电脑将无法打开渡口。确定关闭整个渡口吗？";
+    if (!window.confirm(warning)) return;
+    const button = byId("shutdown-service-button");
+    button.disabled = true;
+    button.textContent = "正在关闭…";
+    try {
+      const response = await fetch("/api/shutdown", {
+        method: "POST",
+        headers: { "X-Dukou-Action": "shutdown" },
+      });
+      if (!response.ok) throw new Error("shutdown rejected");
+      byId("shutdown-notice").hidden = false;
+    } catch {
+      button.disabled = false;
+      button.textContent = "关闭渡口服务";
+      announce("未能关闭渡口，请回到运行窗口按 Ctrl+C");
+    }
+  });
+
   renderSenderFiles();
   setStation(isDemo ? "online" : "offline");
+  void initializeLanAccess();
 })();

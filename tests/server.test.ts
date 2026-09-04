@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { startServer } from "../src/server";
+import { isLoopbackAddress, startServer } from "../src/server";
 
 const runningServers: Array<ReturnType<typeof startServer>> = [];
 const runningSockets: WebSocket[] = [];
@@ -70,7 +70,25 @@ function nextJsonMessage(socket: WebSocket): Promise<unknown | undefined> {
   });
 }
 
+function nextRawMessage(socket: WebSocket): Promise<unknown | undefined> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(undefined), 1_000);
+    timeout.unref();
+    socket.addEventListener("message", (event) => {
+      clearTimeout(timeout);
+      resolve(event.data);
+    }, { once: true });
+  });
+}
+
 describe("Bun HTTP/WebSocket server", () => {
+  test("recognizes loopback shutdown callers without trusting LAN or mapped remote addresses", () => {
+    expect(isLoopbackAddress("127.0.0.1")).toBe(true);
+    expect(isLoopbackAddress("::1")).toBe(true);
+    expect(isLoopbackAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isLoopbackAddress("192.168.31.45")).toBe(false);
+    expect(isLoopbackAddress("::ffff:192.168.31.45")).toBe(false);
+  });
   test.serial("starts from the command line and reports its actual URL", async () => {
     const child = Bun.spawn([process.execPath, "src/server.ts"], {
       cwd: resolve(import.meta.dir, ".."),
@@ -143,6 +161,73 @@ describe("Bun HTTP/WebSocket server", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toStartWith("application/json");
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test("returns sanitized runtime information with the actual bound port", async () => {
+    const server = startServer({
+      hostname: "127.0.0.1",
+      port: 0,
+      networkInterfaces: () => ({
+        "JiuX TUN": [
+          {
+            address: "198.18.0.1",
+            netmask: "255.255.255.0",
+            family: "IPv4",
+            mac: "00:00:00:00:00:00",
+            internal: false,
+            cidr: "198.18.0.1/24",
+          },
+        ],
+        WiFi: [
+          {
+            address: "192.168.31.73",
+            netmask: "255.255.255.0",
+            family: "IPv4",
+            mac: "00:00:00:00:00:00",
+            internal: false,
+            cidr: "192.168.31.73/24",
+          },
+        ],
+      }),
+    });
+    runningServers.push(server);
+
+    const response = await fetch(new URL("/api/runtime", server.url));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      version: "0.2.0",
+      port: server.url.port ? Number(server.url.port) : 80,
+      lanUrls: [
+        `http://192.168.31.73:${server.url.port}`,
+        `http://198.18.0.1:${server.url.port}`,
+      ],
+      recommendedUrl: `http://192.168.31.73:${server.url.port}`,
+      canShutdown: true,
+    });
+
+    const removedQr = await fetch(new URL("/api/runtime/qr", server.url));
+    expect(removedQr.status).toBe(404);
+  });
+
+  test("requires a loopback same-origin action request before shutting down", async () => {
+    const server = startServer({ hostname: "127.0.0.1", port: 0 });
+    runningServers.push(server);
+    const denied = await fetch(new URL("/api/shutdown", server.url), { method: "POST" });
+    expect(denied.status).toBe(403);
+
+    const accepted = await fetch(new URL("/api/shutdown", server.url), {
+      method: "POST",
+      headers: {
+        Origin: server.url.origin,
+        "X-Dukou-Action": "shutdown",
+      },
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ ok: true });
+    await Bun.sleep(100);
+    await expect(fetch(new URL("/healthz", server.url))).rejects.toThrow();
   });
 
   test("adds the security policy headers to successful and error responses", async () => {
@@ -269,6 +354,51 @@ describe("Bun HTTP/WebSocket server", () => {
       type: "signal",
       signal: { type: "offer", sdp: "sender-sdp" },
     });
+  });
+
+  test("opens an explicit one-time relay and forwards opaque binary frames", async () => {
+    const server = makeServer();
+    const sender = (await tryOpenWebSocket(server)).socket;
+    const receiver = (await tryOpenWebSocket(server)).socket;
+    const createdPromise = nextJsonMessage(sender);
+    sender.send(JSON.stringify({ type: "create_room" }));
+    const code = (await createdPromise as any).code;
+    const request = nextJsonMessage(sender);
+    const waiting = nextJsonMessage(receiver);
+    receiver.send(JSON.stringify({ type: "join_room", code }));
+    await Promise.all([request, waiting]);
+    const senderJoined = nextJsonMessage(sender);
+    const receiverJoined = nextJsonMessage(receiver);
+    sender.send(JSON.stringify({ type: "approve_join" }));
+    await Promise.all([senderJoined, receiverJoined]);
+    const relayRequested = nextJsonMessage(receiver);
+    sender.send(JSON.stringify({ type: "request_relay" }));
+    expect(await relayRequested).toEqual({ type: "relay_requested" });
+    const senderReady = nextJsonMessage(sender);
+    const receiverReady = nextJsonMessage(receiver);
+    receiver.send(JSON.stringify({ type: "approve_relay" }));
+    const [senderCredential, receiverCredential] = await Promise.all([senderReady, receiverReady]) as any[];
+
+    const openRelay = async (token: string) => {
+      const url = new URL(`/relay?token=${encodeURIComponent(token)}`, server.url);
+      url.protocol = "ws:";
+      const socket = new WebSocket(url, { headers: { Origin: server.url.origin } });
+      runningSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener("open", () => resolve(), { once: true });
+        socket.addEventListener("error", reject, { once: true });
+      });
+      return socket;
+    };
+    const senderRelay = await openRelay(senderCredential.token);
+    const senderOpened = nextJsonMessage(senderRelay);
+    const receiverRelay = await openRelay(receiverCredential.token);
+    const receiverOpened = nextJsonMessage(receiverRelay);
+    expect(await senderOpened).toEqual({ type: "relay_open" });
+    expect(await receiverOpened).toEqual({ type: "relay_open" });
+    const delivered = nextRawMessage(receiverRelay);
+    senderRelay.send(Uint8Array.from([7, 8, 9]));
+    expect(new Uint8Array(await delivered as ArrayBuffer)).toEqual(Uint8Array.from([7, 8, 9]));
   });
 
   test("actively expires an idle room and releases its sender", async () => {
