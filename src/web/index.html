@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f1ebdd" />
+    <title>渡口 · 局域网文件快传</title>
+    <link rel="stylesheet" href="./app.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="paper-noise" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="#" aria-label="渡口首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span><b>渡口</b><small>DUKOU / LOCAL TRANSFER</small></span>
+      </a>
+      <div class="station-status" aria-label="配对服务状态">
+        <span class="signal-dot" aria-hidden="true"></span>
+        <span id="station-status-text">尚未连接配对站</span>
+        <span class="station-id">航标 24</span>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <section id="home-screen" class="screen home-screen" aria-labelledby="home-title">
+        <div class="hero-copy reveal">
+          <p class="kicker">LOCAL ROUTE · ENCRYPTED CHANNEL · NO RELAY</p>
+          <h1 id="home-title">文件不过云，<br /><em>只过桥</em></h1>
+          <p class="hero-lead">两台电脑打开这一页，用一个接收码建立直达航线。</p>
+        </div>
+
+        <div class="route-proof reveal delay-1" aria-label="传输特点">
+          <span><i class="proof-dot green"></i>浏览器点对点</span>
+          <span><i class="proof-dot orange"></i>传输自动加密</span>
+          <span><i class="proof-dot ink"></i>文件不经服务器</span>
+          <span><i class="proof-dot outline"></i>同一局域网</span>
+        </div>
+
+        <div class="role-grid reveal delay-2">
+          <button id="choose-sender" class="role-ticket role-ticket-primary" type="button">
+            <span class="ticket-index">01 / 发件口</span>
+            <span class="ticket-title">发送文件</span>
+            <span class="ticket-copy">从这台电脑装载文件，生成一次性接收码。</span>
+            <span class="ticket-action">开始装载 <i aria-hidden="true">↗</i></span>
+          </button>
+          <button id="choose-receiver" class="role-ticket" type="button">
+            <span class="ticket-index">02 / 接件口</span>
+            <span class="ticket-title">接收文件</span>
+            <span class="ticket-copy">输入发送方给你的接收码，让文件在这里靠岸。</span>
+            <span class="ticket-action">准备靠岸 <i aria-hidden="true">↘</i></span>
+          </button>
+        </div>
+
+        <p class="service-note reveal delay-3">
+          <span aria-hidden="true">※</span>
+          网页和配对需要访问服务；连接建立后，文件只在两台浏览器之间传输。
+        </p>
+      </section>
+
+      <section id="sender-screen" class="screen workspace" aria-labelledby="sender-title" hidden>
+        <div class="workspace-main">
+          <div class="section-heading">
+            <button class="back-button" type="button" data-action="back-home">← 返回</button>
+            <p class="kicker">01 / 发件口</p>
+            <h2 id="sender-title">选择要发送的文件</h2>
+            <p id="sender-subtitle">先装载货单，再生成只用一次的接收码。</p>
+          </div>
+
+          <div id="sender-prepare" class="sender-stage">
+            <label id="send-dropzone" class="drop-ticket" for="send-file-input">
+              <input id="send-file-input" type="file" multiple />
+              <span class="drop-symbol" aria-hidden="true">＋</span>
+              <strong>把文件拖到票面</strong>
+              <span>或点击选择 · 可一次选择多个文件</span>
+            </label>
+
+            <div class="manifest-panel" aria-labelledby="manifest-heading">
+              <div class="manifest-header">
+                <div>
+                  <p class="tiny-label">CARGO MANIFEST</p>
+                  <h3 id="manifest-heading">本次货单</h3>
+                </div>
+                <span id="sender-summary" class="manifest-summary">尚未选择文件</span>
+              </div>
+              <ul id="sender-file-list" class="file-list empty-list">
+                <li class="empty-copy">文件会列在这里；创建房间前仍可移除。</li>
+              </ul>
+            </div>
+
+            <button id="create-room-button" class="primary-button full-button" type="button" disabled>
+              生成接收码
+            </button>
+          </div>
+
+          <div id="sender-waiting" class="sender-stage" hidden>
+            <div class="code-ticket">
+              <p class="tiny-label">ONE-TIME DOCK CODE</p>
+              <span>把接收码告诉另一台电脑</span>
+              <output id="room-code" class="room-code" aria-label="接收码">— — —</output>
+              <div class="code-actions">
+                <button id="copy-code-button" class="secondary-button" type="button">复制接收码</button>
+                <span id="room-expiry">10:00 后失效</span>
+              </div>
+            </div>
+
+            <div id="join-wait" class="route-status" role="status">
+              <span class="route-pulse" aria-hidden="true"></span>
+              <div><strong>等待另一台电脑靠岸…</strong><small>保持此页面打开</small></div>
+            </div>
+
+            <div id="join-request" class="approval-ticket" hidden>
+              <div>
+                <p class="tiny-label">CONNECTION REQUEST</p>
+                <h3>一台浏览器请求接收</h3>
+                <p>发送方允许后才会建立点对点通道</p>
+              </div>
+              <div class="approval-actions">
+                <button id="approve-peer-button" class="primary-button" type="button">允许连接</button>
+                <button id="reject-peer-button" class="text-button" type="button">拒绝</button>
+              </div>
+            </div>
+
+            <div id="sender-connected" class="route-status route-status-success" role="status" hidden>
+              <span class="route-pulse" aria-hidden="true"></span>
+              <div><strong>等待对方确认文件</strong><small>连接已加密 · 文件尚未开始发送</small></div>
+            </div>
+
+            <div id="sender-progress" class="progress-ticket" hidden>
+              <div class="progress-topline"><span>正在摆渡</span><output id="sender-progress-percent">0%</output></div>
+              <div class="waterline" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <i id="sender-waterline-fill"></i><span aria-hidden="true">◆</span>
+              </div>
+              <div class="progress-metrics">
+                <div><small>当前文件</small><strong id="sender-progress-file">等待接收方确认</strong></div>
+                <div><small>已发送</small><strong id="sender-progress-bytes">0 B</strong></div>
+                <div><small>状态</small><strong>局域网直连</strong></div>
+              </div>
+            </div>
+
+            <p id="sender-error" class="inline-error" role="alert" hidden></p>
+
+            <button class="danger-link" type="button" data-action="cancel-session">关闭这次传输</button>
+          </div>
+        </div>
+
+        <aside class="route-board" aria-label="连接说明">
+          <div class="board-heading"><span>ROUTE / 01</span><strong>航线状态</strong></div>
+          <div class="route-graphic" aria-hidden="true">
+            <span class="port port-a">A</span><i></i><span class="ferry-mark">◆</span><i></i><span class="port">B</span>
+          </div>
+          <dl class="fact-grid">
+            <div><dt>传输路径</dt><dd id="sender-route-fact">等待建立</dd></div>
+            <div><dt>加密通道</dt><dd id="sender-encryption-fact">等待建立</dd></div>
+            <div><dt>文件服务器</dt><dd>不会经过</dd></div>
+            <div><dt>中转回退</dt><dd>已禁用</dd></div>
+          </dl>
+          <p class="board-warning"><b>同一局域网限定</b>无法直连时会明确停止，不会改为上传服务器。</p>
+        </aside>
+      </section>
+
+      <section id="receiver-screen" class="screen workspace" aria-labelledby="receiver-title" hidden>
+        <div class="workspace-main">
+          <div class="section-heading">
+            <button class="back-button" type="button" data-action="back-home">← 返回</button>
+            <p class="kicker">02 / 接件口</p>
+            <h2 id="receiver-title">输入发送方的接收码</h2>
+            <p id="receiver-subtitle">接收码只负责找到这趟传输，文件仍需你确认。</p>
+          </div>
+
+          <div id="receiver-code-stage" class="receiver-stage">
+            <form id="join-room-form" class="join-form">
+              <label for="join-code">6 位接收码</label>
+              <input
+                id="join-code"
+                name="code"
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                maxlength="7"
+                placeholder="___ ___"
+                aria-label="6 位接收码"
+              />
+              <button id="join-room-button" class="primary-button full-button" type="submit" disabled>连接发送方</button>
+            </form>
+            <p id="join-error" class="inline-error" role="alert" hidden></p>
+          </div>
+
+          <div id="receiver-searching" class="receiver-stage" hidden>
+            <div class="search-ticket" role="status">
+              <div class="search-stripes" aria-hidden="true"></div>
+              <p class="tiny-label">ROUTE CHECK</p>
+              <h3>正在查找这趟传输…</h3>
+              <p>等待发送方允许连接</p>
+            </div>
+          </div>
+
+          <div id="receiver-offer" class="receiver-stage" hidden>
+            <div class="manifest-panel offer-panel">
+              <div class="manifest-header">
+                <div><p class="tiny-label">INCOMING MANIFEST</p><h3>来自发送方</h3></div>
+                <span id="receiver-summary" class="manifest-summary">1 个文件 · 18.4 MB</span>
+              </div>
+              <ul id="receiver-file-list" class="file-list"></ul>
+              <p class="consent-note">确认前不会开始接收。文件将先暂存在浏览器中，完成后由你保存。</p>
+            </div>
+            <div class="button-row">
+              <button id="accept-files-button" class="primary-button" type="button">接收这些文件</button>
+              <button id="reject-files-button" class="secondary-button" type="button">不是这趟，返回</button>
+            </div>
+          </div>
+
+          <div id="receiver-progress" class="receiver-stage" hidden>
+            <div class="progress-ticket">
+              <div class="progress-topline"><span>正在摆渡</span><output id="progress-percent">0%</output></div>
+              <div class="waterline" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <i id="waterline-fill"></i><span aria-hidden="true">◆</span>
+              </div>
+              <div class="progress-metrics">
+                <div><small>当前文件</small><strong id="progress-file">设计素材包.zip</strong></div>
+                <div><small>已接收</small><strong id="progress-bytes">0 B / 18.4 MB</strong></div>
+                <div><small>状态</small><strong id="receiver-connection-status">局域网直连</strong></div>
+              </div>
+            </div>
+            <button id="cancel-transfer-button" class="danger-link" type="button">取消摆渡</button>
+          </div>
+
+          <div id="receiver-complete" class="receiver-stage" hidden>
+            <div class="arrival-stamp" aria-hidden="true">ARRIVED</div>
+            <p class="tiny-label">TRANSFER COMPLETE</p>
+            <h3 class="complete-title">接收完成</h3>
+            <p>文件已抵达这台浏览器。点击下方按钮保存到电脑。</p>
+            <div id="received-files" class="received-files"></div>
+            <button class="secondary-button" type="button" data-action="back-home">返回首页</button>
+          </div>
+
+          <p id="receiver-error" class="inline-error" role="alert" hidden></p>
+        </div>
+
+        <aside class="route-board" aria-label="接收安全说明">
+          <div class="board-heading"><span>ROUTE / 02</span><strong>靠岸检查</strong></div>
+          <dl class="fact-grid">
+            <div><dt>局域网路线</dt><dd id="receiver-route-fact">待验证</dd></div>
+            <div><dt>通道加密</dt><dd id="receiver-encryption-fact">待建立</dd></div>
+            <div><dt>文件内容留存</dt><dd>无</dd></div>
+            <div><dt>自动执行</dt><dd>关闭</dd></div>
+          </dl>
+          <p class="board-warning"><b>你始终掌握最后一步</b>接收完成不等于已经保存，浏览器会在你点击后处理下载。</p>
+        </aside>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>DUKOU / V0.1</span>
+      <span>信令只搭桥，文件不登岸</span>
+    </footer>
+
+    <div id="live-region" class="sr-only" aria-live="polite"></div>
+  </body>
+</html>
