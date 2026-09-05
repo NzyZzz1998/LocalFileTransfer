@@ -15,7 +15,8 @@ import {
   type SignalingConfig,
 } from "./signaling-core";
 import { createRuntimeInfo, type NetworkInterfaces } from "./runtime-info";
-import { RelayHub } from "./relay-hub";
+import { RelayHub, RELAY_DEFAULTS, type RelayClosure, type RelayHubOptions } from "./relay-hub";
+import { RelayBackpressure, RELAY_QUEUE_DEFAULTS, type RelayQueueOptions } from "./relay-backpressure";
 
 export const APP_VERSION = "0.2.0";
 
@@ -27,6 +28,8 @@ export interface ServerOptions {
   nextRoomCode?: () => string;
   sweepIntervalMs?: number;
   networkInterfaces?: () => NetworkInterfaces;
+  relayEnabled?: boolean;
+  relayConfig?: Partial<Omit<RelayHubOptions, "now"> & RelayQueueOptions>;
 }
 
 interface SignalingSocketData {
@@ -82,8 +85,16 @@ export function isLoopbackAddress(address: string | undefined): boolean {
   return address === "::1" || address === "127.0.0.1" || address === "::ffff:127.0.0.1";
 }
 
+export function parseRelayEnabled(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  if (["true", "1"].includes(value.trim().toLowerCase())) return true;
+  if (["false", "0"].includes(value.trim().toLowerCase())) return false;
+  throw new Error("RELAY_ENABLED must be true, false, 1 or 0");
+}
+
 export function startServer(options: ServerOptions = {}) {
-  const config = options.signalingConfig ?? signalingConfig;
+  const relayEnabled = options.relayEnabled ?? options.signalingConfig?.relayEnabled ?? parseRelayEnabled(Bun.env.RELAY_ENABLED);
+  const config = { ...(options.signalingConfig ?? signalingConfig), relayEnabled };
   const core = new SignalingCore(config, {
     now: options.now ?? Date.now,
     nextRoomCode:
@@ -93,10 +104,15 @@ export function startServer(options: ServerOptions = {}) {
   });
   const sockets = new Map<string, Bun.ServerWebSocket<SocketData>>();
   const relaySockets = new Map<string, Bun.ServerWebSocket<SocketData>>();
+  const relayConfig = { ...RELAY_DEFAULTS, ...RELAY_QUEUE_DEFAULTS, ...options.relayConfig };
   const relayHub = new RelayHub({
+    ...relayConfig,
     now: options.now ?? Date.now,
-    credentialTtlMs: 60_000,
-    maxFrameBytes: 256 * 1024,
+  });
+  const relayBackpressure = new RelayBackpressure({
+    maxSocketBytes: relayConfig.maxSocketBytes,
+    maxSessionBytes: relayConfig.maxSessionBytes,
+    maxTotalBytes: relayConfig.maxTotalBytes,
   });
   const networkInterfaces = options.networkInterfaces ?? readNetworkInterfaces;
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
@@ -110,19 +126,56 @@ export function startServer(options: ServerOptions = {}) {
   };
 
   const dispatch = (actions: SignalingAction[]) => {
+    const rejectedTokens = new Set<string>();
     for (const action of actions) {
       if (action.kind === "authorize_relay") {
-        relayHub.authorize(action.sessionId, action.senderToken, action.receiverToken);
+        if (!relayEnabled || !relayHub.authorize(
+          action.sessionId, action.senderToken, action.receiverToken, action.roomCode, action.clientKeys,
+        )) {
+          rejectedTokens.add(action.senderToken);
+          rejectedTokens.add(action.receiverToken);
+          dispatch(core.relayEnded(action.roomCode, action.sessionId, relayEnabled ? "RELAY_LIMIT" : "RELAY_DISABLED"));
+        }
+        continue;
+      }
+      if (action.kind === "revoke_relay") {
+        finishRelay(relayHub.revokeRoom(action.roomCode, "RELAY_CLOSED", action.sessionId));
         continue;
       }
       const socket = sockets.get(action.peerId);
       if (!socket) continue;
       if (action.kind === "send") {
+        if (action.message.type === "relay_ready" && rejectedTokens.has(action.message.token)) continue;
         socket.send(JSON.stringify(action.message));
       } else {
         socket.close(action.code, action.reason);
       }
     }
+  };
+
+  const finishRelay = (closure: RelayClosure | null) => {
+    if (!closure) return;
+    // Remove all indexes before closing sockets: re-entrant close events cannot affect a replacement session.
+    for (const connectionId of closure.connectionIds) {
+      const socket = relaySockets.get(connectionId);
+      relaySockets.delete(connectionId);
+      relayBackpressure.remove(connectionId);
+      socket?.close(4000, closure.reason);
+    }
+    dispatch(core.relayEnded(
+      closure.roomCode, closure.sessionId, closure.reason === "RELAY_CLOSED" ? undefined : closure.reason,
+    ));
+  };
+
+  const sendRelay = (connectionId: string, frame: string | Uint8Array): boolean => {
+    const socket = relaySockets.get(connectionId);
+    const sessionId = relayHub.sessionIdFor(connectionId);
+    if (!socket || !sessionId) return false;
+    if (!relayBackpressure.send(connectionId, sessionId, socket, frame)) {
+      finishRelay(relayHub.disconnect(connectionId, "RELAY_LIMIT"));
+      return false;
+    }
+    return true;
   };
 
   const bunServer = Bun.serve<SocketData>({
@@ -152,16 +205,18 @@ export function startServer(options: ServerOptions = {}) {
         });
       }
       if (pathname === "/relay") {
+        if (!relayEnabled) return secureResponse("RELAY_DISABLED", { status: 503 });
         if (request.headers.get("origin") !== requestUrl.origin) {
           return secureResponse("Forbidden WebSocket origin", { status: 403 });
         }
         const token = requestUrl.searchParams.get("token") ?? "";
         const connectionId = crypto.randomUUID();
+        for (const closure of relayHub.sweep()) finishRelay(closure);
         if (!relayHub.claim(token, connectionId)) {
           return secureResponse("Invalid or expired relay credential", { status: 403 });
         }
         if (server.upgrade(request, { data: { kind: "relay", connectionId } })) return;
-        relayHub.disconnect(connectionId);
+        finishRelay(relayHub.disconnect(connectionId));
         return secureResponse("WebSocket upgrade required", { status: 426 });
       }
       if (pathname === "/ws") {
@@ -188,7 +243,7 @@ export function startServer(options: ServerOptions = {}) {
       if (pathname === "/api/runtime") {
         const runtime = createRuntimeInfo(networkInterfaces(), bunServer.port, APP_VERSION);
         const canShutdown = isLoopbackAddress(server.requestIP(request)?.address);
-        return secureResponse(JSON.stringify({ ...runtime, canShutdown }), {
+        return secureResponse(JSON.stringify({ ...runtime, canShutdown, relayEnabled }), {
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             "Cache-Control": "no-store",
@@ -212,31 +267,39 @@ export function startServer(options: ServerOptions = {}) {
           sockets.set(socket.data.peerId, socket);
           return;
         }
+        if (!relayHub.sessionIdFor(socket.data.connectionId)) {
+          socket.close(4000, "RELAY_CLOSED");
+          return;
+        }
         relaySockets.set(socket.data.connectionId, socket);
         const counterpartId = relayHub.counterpart(socket.data.connectionId);
         const counterpart = counterpartId ? relaySockets.get(counterpartId) : undefined;
         if (counterpart) {
           const ready = JSON.stringify({ type: "relay_open" });
-          socket.send(ready);
-          counterpart.send(ready);
+          if (sendRelay(socket.data.connectionId, ready)) sendRelay(counterpartId!, ready);
         }
       },
       message(socket, message) {
         if (socket.data.kind === "relay") {
           if (typeof message === "string") {
-            socket.close(1003, "binary relay frames only");
+            finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_PROTOCOL"));
             return;
           }
           const payload = message instanceof Uint8Array ? message : new Uint8Array(message);
           try {
             relayHub.validateFrame(payload);
           } catch {
-            socket.close(1009, "relay frame too large");
+            finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_LIMIT"));
+            return;
+          }
+          if (!relayHub.touch(socket.data.connectionId)) {
+            finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_TIMEOUT"));
             return;
           }
           const counterpartId = relayHub.counterpart(socket.data.connectionId);
           const counterpart = counterpartId ? relaySockets.get(counterpartId) : undefined;
-          if (counterpart) counterpart.send(payload);
+          if (counterpart) sendRelay(counterpartId!, payload);
+          else finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_NOT_READY"));
           return;
         }
         const payload =
@@ -247,27 +310,32 @@ export function startServer(options: ServerOptions = {}) {
               : new Uint8Array(message);
         dispatch(core.receive(socket.data.peerId, payload));
       },
-      close(socket) {
+      drain(socket) {
+        if (socket.data.kind !== "relay") return;
+        relayBackpressure.drain(socket.data.connectionId);
+        if (!relayHub.touch(socket.data.connectionId)) {
+          finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_TIMEOUT"));
+        }
+      },
+      close(socket, code) {
         if (socket.data.kind === "relay") {
-          const counterpartId = relayHub.counterpart(socket.data.connectionId);
           relaySockets.delete(socket.data.connectionId);
-          relayHub.disconnect(socket.data.connectionId);
-          if (counterpartId) {
-            relaySockets.get(counterpartId)?.close(1001, "relay peer left");
-            relaySockets.delete(counterpartId);
-          }
+          relayBackpressure.remove(socket.data.connectionId);
+          finishRelay(relayHub.disconnect(socket.data.connectionId, code === 1009 ? "RELAY_LIMIT" : "RELAY_CLOSED"));
           return;
         }
         sockets.delete(socket.data.peerId);
         dispatch(core.disconnect(socket.data.peerId));
       },
-      maxPayloadLength: Math.max(config.maxMessageBytes, 256 * 1024),
+      maxPayloadLength: Math.max(config.maxMessageBytes, relayConfig.maxFrameBytes),
+      backpressureLimit: relayConfig.maxSocketBytes,
+      closeOnBackpressureLimit: false,
     },
   });
   sweepTimer = setInterval(
     () => {
       dispatch(core.sweepExpiredRooms());
-      relayHub.sweep();
+      for (const closure of relayHub.sweep()) finishRelay(closure);
     },
     options.sweepIntervalMs ?? 1_000,
   );
@@ -278,7 +346,7 @@ export function startServer(options: ServerOptions = {}) {
       return bunServer.url;
     },
     get runtime() {
-      return createRuntimeInfo(networkInterfaces(), bunServer.port, APP_VERSION);
+      return { ...createRuntimeInfo(networkInterfaces(), bunServer.port, APP_VERSION), relayEnabled };
     },
     stop(closeActiveConnections?: boolean) {
       stop(closeActiveConnections);

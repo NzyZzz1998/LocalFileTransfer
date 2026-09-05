@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { SignalingCore } from "../src/signaling-core";
+import { SignalingCore, type SignalingConfig } from "../src/signaling-core";
 
 
-function makeCore(codes: string[] = ["583204"]) {
+function makeCore(codes: string[] = ["583204"], overrides: Partial<SignalingConfig> = {}) {
   let now = 1_000;
   let index = 0;
   const core = new SignalingCore(
@@ -10,6 +10,7 @@ function makeCore(codes: string[] = ["583204"]) {
       roomTtlMs: 600_000,
       maxMessageBytes: 65_536,
       joinRateLimit: { maxAttempts: 5, windowMs: 60_000 },
+      ...overrides,
     },
     {
       now: () => now,
@@ -45,9 +46,11 @@ describe("SignalingCore rooms", () => {
     expect(core.receive("receiver", JSON.stringify({ type: "approve_relay" }))).toEqual([
       {
         kind: "authorize_relay",
+        roomCode: "583204",
         sessionId: "relay-session",
         senderToken: "sender-token",
         receiverToken: "receiver-token",
+        clientKeys: ["10.0.0.1", "10.0.0.2"],
       },
       {
         kind: "send",
@@ -60,6 +63,32 @@ describe("SignalingCore rooms", () => {
         message: { type: "relay_ready", token: "receiver-token", role: "receiver" },
       },
     ]);
+  });
+  test("blocks reauthorization while issued and revokes that session on leave", () => {
+    const { core } = makeCore();
+    core.connect({ id: "sender", clientKey: "client-a" });
+    core.connect({ id: "receiver", clientKey: "client-b" });
+    core.receive("sender", JSON.stringify({ type: "create_room" }));
+    core.receive("receiver", JSON.stringify({ type: "join_room", code: "583204" }));
+    core.receive("sender", JSON.stringify({ type: "approve_join" }));
+    core.receive("sender", JSON.stringify({ type: "request_relay" }));
+    core.receive("receiver", JSON.stringify({ type: "approve_relay" }));
+
+    expect(core.receive("sender", JSON.stringify({ type: "request_relay" }))[0])
+      .toMatchObject({ message: { code: "STATE_CONFLICT" } });
+    expect(core.receive("sender", JSON.stringify({ type: "leave" }))[0])
+      .toEqual({ kind: "revoke_relay", roomCode: "583204", sessionId: "relay-session" });
+  });
+
+  test("disabled relay rejects requests without notifying the receiver", () => {
+    const { core } = makeCore(["583204"], { relayEnabled: false });
+    core.connect({ id: "sender", clientKey: "client-a" });
+    core.connect({ id: "receiver", clientKey: "client-b" });
+    core.receive("sender", JSON.stringify({ type: "create_room" }));
+    core.receive("receiver", JSON.stringify({ type: "join_room", code: "583204" }));
+    core.receive("sender", JSON.stringify({ type: "approve_join" }));
+    expect(core.receive("sender", JSON.stringify({ type: "request_relay" })))
+      .toMatchObject([{ kind: "send", peerId: "sender", message: { code: "RELAY_DISABLED" } }]);
   });
   test("create_room returns a six-digit room code with a fixed expiry", () => {
     const { core } = makeCore();

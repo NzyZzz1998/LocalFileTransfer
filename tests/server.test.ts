@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { isLoopbackAddress, startServer } from "../src/server";
+import { isLoopbackAddress, parseRelayEnabled, startServer, type ServerOptions } from "../src/server";
 
 const runningServers: Array<ReturnType<typeof startServer>> = [];
 const runningSockets: WebSocket[] = [];
 
-function makeServer() {
-  const server = startServer({ hostname: "127.0.0.1", port: 0 });
+function makeServer(options: ServerOptions = {}) {
+  const server = startServer({ hostname: "127.0.0.1", port: 0, ...options });
   runningServers.push(server);
   return server;
 }
@@ -81,7 +81,84 @@ function nextRawMessage(socket: WebSocket): Promise<unknown | undefined> {
   });
 }
 
+async function pairedSignals(server: ReturnType<typeof startServer>) {
+  const sender = (await tryOpenWebSocket(server)).socket;
+  const receiver = (await tryOpenWebSocket(server)).socket;
+  const created = nextJsonMessage(sender);
+  sender.send(JSON.stringify({ type: "create_room" }));
+  const code = (await created as { code: string }).code;
+  const requested = nextJsonMessage(sender);
+  const waiting = nextJsonMessage(receiver);
+  receiver.send(JSON.stringify({ type: "join_room", code }));
+  await Promise.all([requested, waiting]);
+  const senderJoined = nextJsonMessage(sender);
+  const receiverJoined = nextJsonMessage(receiver);
+  sender.send(JSON.stringify({ type: "approve_join" }));
+  await Promise.all([senderJoined, receiverJoined]);
+  return { sender, receiver };
+}
+
+async function authorizeRelay(signals: { sender: WebSocket; receiver: WebSocket }) {
+  const requested = nextJsonMessage(signals.receiver);
+  signals.sender.send(JSON.stringify({ type: "request_relay" }));
+  expect(await requested).toEqual({ type: "relay_requested" });
+  const senderReady = nextJsonMessage(signals.sender);
+  const receiverReady = nextJsonMessage(signals.receiver);
+  signals.receiver.send(JSON.stringify({ type: "approve_relay" }));
+  return await Promise.all([senderReady, receiverReady]) as Array<{ type: string; token: string; code?: string }>;
+}
+
+async function openRelay(server: ReturnType<typeof startServer>, token: string) {
+  const url = new URL(`/relay?token=${encodeURIComponent(token)}`, server.url);
+  url.protocol = "ws:";
+  const socket = new WebSocket(url, { headers: { Origin: server.url.origin } });
+  runningSockets.push(socket);
+  // Install before open: the server may send relay_open in the same network turn.
+  const relayOpened = nextJsonMessage(socket);
+  await new Promise<void>((resolve, reject) => {
+    socket.addEventListener("open", () => resolve(), { once: true });
+    socket.addEventListener("error", reject, { once: true });
+  });
+  return { socket, relayOpened };
+}
+
+function nextClose(socket: WebSocket): Promise<CloseEvent> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("relay did not close")), 1_000);
+    socket.addEventListener("close", (event) => {
+      clearTimeout(timeout);
+      resolve(event);
+    }, { once: true });
+  });
+}
+
 describe("Bun HTTP/WebSocket server", () => {
+  test("accepts only explicit boolean relay flag values", () => {
+    expect(parseRelayEnabled(undefined)).toBe(true);
+    expect(parseRelayEnabled("true")).toBe(true);
+    expect(parseRelayEnabled("1")).toBe(true);
+    expect(parseRelayEnabled("false")).toBe(false);
+    expect(parseRelayEnabled("0")).toBe(false);
+    expect(() => parseRelayEnabled("offf")).toThrow("RELAY_ENABLED");
+  });
+
+  test("disabled relay is advertised and rejected while direct signaling remains available", async () => {
+    const server = makeServer({ relayEnabled: false });
+    const runtime = await (await fetch(new URL("/api/runtime", server.url))).json();
+    expect(runtime.relayEnabled).toBe(false);
+    const endpoint = await fetch(new URL("/relay?token=unused", server.url), {
+      headers: { Origin: server.url.origin },
+    });
+    expect(endpoint.status).toBe(503);
+    expect(await endpoint.text()).toBe("RELAY_DISABLED");
+    const { sender, receiver } = await pairedSignals(server);
+    const rejected = nextJsonMessage(sender);
+    sender.send(JSON.stringify({ type: "request_relay" }));
+    expect(await rejected).toMatchObject({ type: "error", code: "RELAY_DISABLED" });
+    const forwarded = nextJsonMessage(receiver);
+    sender.send(JSON.stringify({ type: "signal", signal: { type: "offer", sdp: "direct-still-works" } }));
+    expect(await forwarded).toMatchObject({ type: "signal", signal: { sdp: "direct-still-works" } });
+  });
   test("recognizes loopback shutdown callers without trusting LAN or mapped remote addresses", () => {
     expect(isLoopbackAddress("127.0.0.1")).toBe(true);
     expect(isLoopbackAddress("::1")).toBe(true);
@@ -92,7 +169,7 @@ describe("Bun HTTP/WebSocket server", () => {
   test.serial("starts from the command line and reports its actual URL", async () => {
     const child = Bun.spawn([process.execPath, "src/server.ts"], {
       cwd: resolve(import.meta.dir, ".."),
-      env: { ...process.env, HOST: "127.0.0.1", PORT: "0" },
+      env: { ...process.env, HOST: "127.0.0.1", PORT: "0", RELAY_ENABLED: "0" },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -110,6 +187,8 @@ describe("Bun HTTP/WebSocket server", () => {
       const response = await fetch(new URL("/healthz", urlText));
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ ok: true });
+      const runtime = await (await fetch(new URL("/api/runtime", urlText))).json();
+      expect(runtime.relayEnabled).toBe(false);
     } finally {
       child.kill();
       await child.exited;
@@ -205,6 +284,7 @@ describe("Bun HTTP/WebSocket server", () => {
       ],
       recommendedUrl: `http://192.168.31.73:${server.url.port}`,
       canShutdown: true,
+      relayEnabled: true,
     });
 
     const removedQr = await fetch(new URL("/api/runtime/qr", server.url));
@@ -431,5 +511,82 @@ describe("Bun HTTP/WebSocket server", () => {
       type: "room_created",
       code: "583204",
     });
+  });
+
+  test("leaving revokes issued tokens and closes both active relay sockets", async () => {
+    const server = makeServer();
+    const signals = await pairedSignals(server);
+    const tokens = await authorizeRelay(signals);
+    const left = nextJsonMessage(signals.receiver);
+    signals.sender.send(JSON.stringify({ type: "leave" }));
+    expect(await left).toEqual({ type: "peer_left" });
+    const invalid = await fetch(new URL(`/relay?token=${tokens[0]!.token}`, server.url), {
+      headers: { Origin: server.url.origin },
+    });
+    expect(invalid.status).toBe(403);
+
+    const activeSignals = await pairedSignals(server);
+    const activeTokens = await authorizeRelay(activeSignals);
+    const senderRelay = await openRelay(server, activeTokens[0]!.token);
+    const receiverRelay = await openRelay(server, activeTokens[1]!.token);
+    await Promise.all([senderRelay.relayOpened, receiverRelay.relayOpened]);
+    const senderClosed = nextClose(senderRelay.socket);
+    const receiverClosed = nextClose(receiverRelay.socket);
+    activeSignals.sender.close();
+    expect((await senderClosed).reason).toBe("RELAY_CLOSED");
+    expect((await receiverClosed).reason).toBe("RELAY_CLOSED");
+  });
+
+  test("an orphan relay times out and a full relay expires when idle", async () => {
+    let now = 1_000;
+    const server = makeServer({
+      now: () => now, sweepIntervalMs: 5,
+      relayConfig: { handshakeTimeoutMs: 10, idleTimeoutMs: 20, maxSessions: 1 },
+    });
+    const orphanSignals = await pairedSignals(server);
+    const orphanTokens = await authorizeRelay(orphanSignals);
+    const orphan = await openRelay(server, orphanTokens[0]!.token);
+    const orphanClosed = nextClose(orphan.socket);
+    now = 1_010;
+    expect((await orphanClosed).reason).toBe("RELAY_TIMEOUT");
+    const invalid = await fetch(new URL(`/relay?token=${orphanTokens[1]!.token}`, server.url), {
+      headers: { Origin: server.url.origin },
+    });
+    expect(invalid.status).toBe(403);
+
+    const signals = await pairedSignals(server);
+    const tokens = await authorizeRelay(signals);
+    const sender = await openRelay(server, tokens[0]!.token);
+    const receiver = await openRelay(server, tokens[1]!.token);
+    await Promise.all([sender.relayOpened, receiver.relayOpened]);
+    const senderClosed = nextClose(sender.socket);
+    const receiverClosed = nextClose(receiver.socket);
+    now = 1_030;
+    expect((await senderClosed).reason).toBe("RELAY_TIMEOUT");
+    expect((await receiverClosed).reason).toBe("RELAY_TIMEOUT");
+  });
+
+  test("capacity failures send errors to both peers without issuing relay_ready", async () => {
+    const server = makeServer({ relayConfig: { maxSessionsPerClient: 1 } });
+    await authorizeRelay(await pairedSignals(server));
+    const rejected = await authorizeRelay(await pairedSignals(server));
+    expect(rejected).toMatchObject([
+      { type: "error", code: "RELAY_LIMIT" },
+      { type: "error", code: "RELAY_LIMIT" },
+    ]);
+    expect(rejected.every((message) => !("token" in message))).toBe(true);
+  });
+
+  test("oversized relay frames close both sides with the same explicit error", async () => {
+    const server = makeServer({ relayConfig: { maxFrameBytes: 4 } });
+    const tokens = await authorizeRelay(await pairedSignals(server));
+    const sender = await openRelay(server, tokens[0]!.token);
+    const receiver = await openRelay(server, tokens[1]!.token);
+    await Promise.all([sender.relayOpened, receiver.relayOpened]);
+    const senderClosed = nextClose(sender.socket);
+    const receiverClosed = nextClose(receiver.socket);
+    sender.socket.send(new Uint8Array(5));
+    expect((await senderClosed).reason).toBe("RELAY_LIMIT");
+    expect((await receiverClosed).reason).toBe("RELAY_LIMIT");
   });
 });

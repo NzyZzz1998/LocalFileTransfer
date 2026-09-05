@@ -4,12 +4,12 @@
 
 ## 追踪信息
 
-- 当前状态：实现完成，L3 真机证据待补
+- 当前状态：本次 Review 代码修复与本地自动化收口；已获提交/推送 test 授权，进入远端 CI 核验，L3 真机仍待补证
 - 目标版本：v0.2
 - 上游来源：`docs/prd_v0.2.md`、`docs/dev_plan_v0.2.md`
-- 下游承接：acceptance / release
+- 下游承接：test 提交/推送（已授权）→ 新 CI 结果与真机补证 → acceptance → 授权后 release
 - 当前事实源：本文
-- 最后更新：2026-09-04
+- 最后更新：2026-09-05
 
 ## 版本目标
 
@@ -75,29 +75,76 @@
 ### M6 跨系统
 
 - [x] M6.1 四目标构建命令与 Windows x64 产物
-- [x] M6.2 Windows 启动/health/runtime/页面 smoke
+- [x] M6.2 Windows 原生产物启动、`/healthz`、runtime、完整资源字节和安全关闭 smoke
 - [x] M6.3 未签名产物说明
 - [ ] M6.4 三组双向真机矩阵
 - [ ] M6.5 acceptance 与 Release 候选
 
 ## 当前阻塞
 
+- 本次明确代码缺陷已收口；NXT-007 已完成本地完整回归与 CI 接线。用户已授权推送 test，远端通过状态需核对对应新提交的 Actions；上方里程碑勾选不等同于发布验收通过。
 - M4.5 需要两台物理设备在 TUN 开启时验证本地中转。
 - M5.3～M5.4 需要真机吞吐基线后才能决定是否调优，当前不得声称“更快”。
-- M6 的 macOS/Linux 原生产物 smoke 与三组双向矩阵需要对应设备；Windows 上的 Bun 1.3.14 非 Windows 交叉编译受官方公开缺陷影响。
+- 四平台原生 CI 编译此前已通过，但编译不等于运行；M6 的 macOS/Linux 原生产物 smoke 与三组双向矩阵仍待补证。
 
-## 最近验证
+## Review 收口状态
 
-- 验证时间：2026-09-04
-- 验证方式：`bun test`、静态与动态 Playwright、真实 WebRTC E2E、真实加密中转 E2E、bundle/Windows 单文件构建与启动 smoke
-- 结果：113 tests / 362 assertions 全绿；WebRTC 直连完成 65,537 字节逐字节一致传输；真实页面加密中转完成文件一致性验证；Windows x64 产物的 health/runtime/页面/中转资源/本机关闭 smoke 通过
-- 遗留问题：TUN 真机、吞吐基线、macOS/Linux 原生 smoke 与三组跨系统矩阵
+| 需求 | 当前状态 | 本批证据 |
+| --- | --- | --- |
+| NXT-001 会话隔离 | 已修复并通过定向回归 | 旧 connect 晚到后零帧、旧连接关闭；文件快照不随新选择变化；旧信令/RTC 回调失效 |
+| NXT-002 直连失败出口 | 第二批已修复并通过回归 | 路线/协商验证失败后保留房间；双方批准中转下载一致；拒绝中转后可再次申请；传输中断不换路 |
+| NXT-003 中转资源 | 已修复并通过自动化 | 唯一授权、房间撤销、容量恢复、半连接/空闲超时、原生缓冲限额及 drain 注入 |
+| NXT-004 真实存储预检 | 第二批已修复并通过回归 | create/write/close/remove 探针、超限禁止接受、合法内存回退、模式锁定、取消及 abort 拒绝仍清理 |
+| NXT-005 错误清理 | 已修复并通过定向回归 | 篡改/重放后 engine failed、sink abort、单次 close、握手 Promise 结束、密钥/队列/轮询释放 |
+| NXT-010A 中转开关 | 已实现并通过自动化 | 环境配置、runtime、信令/HTTP 拒绝、页面禁用；启用后真实 UI 中转成功 |
+| NXT-006 地址/诊断/UX | 已修复，本地通过 | 推荐和备选可复制、空列表/读取失败区分、双方真实时间线、脱敏快照和手动复制；重试货单/限流/断连/完成状态回归 |
+| NXT-007 完整 UI 门禁 | 本地通过；CI 接线完成，远端结果待补 | 一条命令覆盖 direct/UI/lifecycle/recovery/diagnostics；build 依赖 unit/browser，失败不上传发布产物 |
+| NXT-008 原生产物与真机 | 自动化已实现；Windows smoke 通过，其余待补 | 四平台 CI 均已增加原生 smoke；本轮 Windows 新产物独立启动并比对全部资源；Mac/Linux 与 L3 未运行 |
+| NXT-009 吞吐与调优 | 待补证，未调参 | 无跨设备性能基线；不声称更快；N4 数值仍待 PERF 开始前确认 |
+| NXT-010B 发布事实 | 本地材料完成，发布未执行 | README、状态、checksum 与 `docs/release_checklist_v0.2.md` 已同步；不提前批准发布 |
+
+## 首批历史验证（2026-09-05）
+
+- 验证时间：2026-09-05；`test@79d4684` 基础上的本批未提交工作树，不是远端已发布内容
+- 验证方式：`bun test`、`tests/e2e_relay_lifecycle_test.py`、既有 WebRTC 和静态/动态 UI 脚本、bundle/Windows x64 构建
+- 结果：149 tests / 520 assertions 全绿；真实双方 UI 加密中转完成 196,613 字节逐字节一致下载，成功后双方中转 socket 关闭；旧会话晚到与文件快照、关闭中转场景通过；WebRTC 直连 65,537 字节及既有静态/动态 UI 回归通过；bundle 启动及资源一致性测试通过，Windows x64 编译成功
+- 反证：浏览器只替换为旧 HEAD 的 app.js（不修改工作树）时，旧会话关闭与文件快照断言均失败；本批实现通过。
+- 追加验证：中转开启/关闭两种配置下，真实 WebRTC 65,537 字节直连与 OPFS 清理均通过；pending/active relay 各阶段的旧 RTC 晚回调不改变路线或关闭连接。
+- 验证限制：背压使用确定性 native send/drain 注入，不是慢网络 RSS/吞吐实测；本批 Windows 编译产物的额外启动 smoke 命令被执行策略拒绝，未执行，不沿用旧产物结果；真机项和其余 Bugfix 不算通过。
+- 遗留问题：NXT-002/004/006、完整 NXT-007、TUN 真机、吞吐基线、macOS/Linux 原生 smoke 与三组跨系统矩阵
 - 证据状态：新测
 - 失效条件：页面结构、关键状态机或测试环境变化
 
+## 第二批历史验证（2026-09-05）
+
+- 对象：`E:\codex\LocalFileTransfer`，`test@79d4684` 上两批未提交工作树；版本仍为 v0.2.0，不是远端已发布内容。
+- 自动化：`bun test` → **199 pass / 0 fail / 680 assertions**；本批受影响的 PeerSession/storage/app 接线已重测，首批服务端与加密回归未退步。
+- 新浏览器：`python tests/e2e_recovery_preflight_test.py --start-server --case all` → **13 场景全部通过**。覆盖空/抛错 stats、不可信候选、协商失败后真实中转；OPFS create/write 失败的大文件拦截和小文件下载；延迟预检/实际 sink 取消；传输中断禁止换路；stats 延迟；拒绝中转后留房再申请。
+- 旧浏览器：首批 `e2e_relay_lifecycle_test.py` 四个启用场景、既有静态/动态 UI 均通过；中转开/关两种配置下，原 WebRTC 65,537 字节下载一致与 OPFS 清理均通过。
+- 构建：bundle 和 Windows x64 编译成功，`git diff --check` 通过；本批未补编译产物启动 smoke，不沿用旧产物运行证据。
+- 产物：`dist/dukou-windows-x64.exe`，SHA256 `F191AA0995B996D99B7598208A31150C4BD3461A9AFD28958BF5ACF8BE65DD03`；对应上述 dirty 工作树。
+- 证据边界：真实浏览器 API 故障注入，不是跨物理设备验收。1 字节探针仅证明当时可写，不预留整批磁盘空间，不改变 256 MiB 内存合同。大文件测试仅替换元数据，未分配或发送大文件内容。
+- 清理：本批独立测试端口 4133～4137 均无残留监听，历史截图未覆盖；未提交、推送、tag 或发布。
+- 证据状态：新测；相关源码、配置、产物或浏览器环境变化后重测受影响项。
+
+## 本地验证：全部修复收口（提交前，2026-09-05）
+
+- 对象：`E:\codex\LocalFileTransfer`，`test@79d4684985836f42494164b20b093db594397d10` 上三批未提交工作树；版本 `0.2.0`，不是远端已发布对象。
+- 自动化：`bun test` → **217 pass / 0 fail / 757 assertions**，13 个测试文件；包含 3 个真实原生产物 smoke 回归，错误版本与陈旧资源必须失败并清理进程。
+- 浏览器：统一入口 `bun run test:browser` → **全部通过，exit 0**；新 `e2e_diagnostics_test.py` 15 个场景、上批 recovery 13 场景，以及既有直连双配置、UI、lifecycle 均通过。真实页面和故障注入混合，不代替物理设备或性能证据。
+- 独立复核：连续 6 次错码的诊断陈旧、离房后的无效中转按钮均先复现再修复，并由只读 reviewer 在真实页面复核关闭；另有货单重试、活动断连状态和完成后关页的 RED→GREEN 证据。
+- 构建：`bun run build`、Windows x64 编译通过；主代理再执行 `bun run smoke:binary dist/dukou-windows-x64.exe` → `ok:true`、10 个嵌入资源逐字节一致、无头关闭 403、合法本机关闭 200、正常退出 0、无需强制清理。
+- 产物：`dist/dukou-windows-x64.exe`；SHA256 `A8A0157F0DD2CAED1327C819E6A99C8EDE13F64B8C13474330C5BF52ADD46794`，校验文件 `dist/SHA256SUMS.txt`。第二批旧哈希仅保留历史，不再指向当前候选。
+- 依赖与差异：`bun audit` 无已知漏洞；`git diff --check` 通过。系统提示 YAML 将按仓库策略转为 CRLF，不是测试或空白错误。
+- CI 边界：已写入 unit/browser 前置与四原生 smoke 步骤；本轮未推送，因此不声称新 CI 或其他 OS 已运行。本地实际浏览器为 Chrome，CI 配套 Chromium 尚待执行。
+- 证据状态：新测；源码/配置/依赖/浏览器环境变化后重测对应项，重建后重新锁定产物哈希。
+- 清理与授权：统一最终浏览器端口 7616 和原生产物 smoke 端口 9070 均由自有进程管理；未操作用户 3000 服务、系统 TUN 或防火墙，未提交/推送/tag/Release。历史截图未覆盖。
+
 ## 下一步
 
-- 进入物理设备 acceptance：TUN 中转、吞吐基线、macOS/Linux 原生 smoke 与三组跨系统矩阵；不再扩功能。
+- 用户已同意先提交本次全部修复并推送到 `test` 运行 CI；本次不合并 main、不创建 tag/Release、不改变仓库可见性。
+- 本记录以上为提交前的本地证据；新远端 CI 按承载本次修复的提交核对 [Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml)，不会把授权或触发当作通过。
+- 用户方便时再补 Windows↔macOS、TUN 和吞吐。发布面与最小待执行动作见 `docs/release_checklist_v0.2.md`。
 
 ## 记录边界
 

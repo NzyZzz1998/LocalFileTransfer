@@ -72,7 +72,7 @@ def verify_receiver(browser) -> None:
     page.get_by_role("heading", name="输入发送方的接收码").wait_for()
     page.get_by_label("6 位接收码").fill("583204")
     page.get_by_role("button", name="连接发送方").click()
-    page.get_by_role("heading", name="发送方希望改走这台渡口电脑").wait_for(timeout=5_000)
+    page.locator("#receiver-relay-consent h3").wait_for(timeout=5_000)
     page.locator("#receiver-relay-consent").get_by_text("0 B", exact=True).wait_for()
     page.get_by_role("button", name="允许本地中转").click()
     page.locator("#receiver-file-list").get_by_text("设计素材包.zip", exact=True).wait_for(timeout=5_000)

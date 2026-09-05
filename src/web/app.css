@@ -1090,6 +1090,15 @@ h1 em::after {
   font-size: 11px !important;
 }
 
+.lan-address-list { margin: 12px 0; padding: 0; list-style: none; }
+.lan-address-list li { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+.lan-address-list output { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.access-url { white-space: normal; overflow-wrap: anywhere; }
+.copy-fallback { width: min(640px, calc(100% - 32px)); padding: 24px; border: 2px solid var(--ink); background: var(--paper); color: var(--ink); }
+.copy-fallback::backdrop { background: rgba(0, 0, 0, .45); }
+.copy-fallback p { font-size: 13px; }
+.copy-fallback textarea { box-sizing: border-box; width: 100%; min-height: 180px; margin-bottom: 16px; padding: 12px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+
 .shutdown-button {
   min-height: 38px;
   margin-top: 16px;
@@ -1155,6 +1164,9 @@ h1 em::after {
 .route-timeline .done::before { background: var(--green); }
 .route-timeline .active { color: var(--orange); font-weight: 800; }
 .route-timeline .active::before { animation: pulse 1.35s ease-in-out infinite; }
+.route-timeline .failed { color: var(--red); font-weight: 800; }
+.route-timeline .failed::before { background: var(--red); }
+.diagnostic-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 22px; font-size: 12px; color: var(--muted); }
 
 .route-decision,
 .relay-consent {

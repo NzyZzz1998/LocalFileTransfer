@@ -44,11 +44,12 @@
           <div class="access-copy">
             <p class="tiny-label">OPEN ON ANOTHER COMPUTER</p>
             <h2 id="access-title">另一台电脑打开</h2>
-            <p>连接同一 Wi-Fi 或网线网络，在浏览器输入这个地址。</p>
+            <p id="lan-access-status">正在读取服务的地址候选…</p>
             <div class="access-url-row">
               <output id="lan-url" class="access-url">正在查找局域网地址…</output>
               <button id="copy-lan-url" class="secondary-button" type="button" disabled>复制地址</button>
             </div>
+            <ul id="lan-address-list" class="lan-address-list" aria-label="其他地址候选" hidden></ul>
             <button id="shutdown-service-button" class="shutdown-button" type="button" hidden>关闭渡口服务</button>
             <p id="lan-url-note" class="access-note">若地址打不开，请检查系统防火墙和访客 Wi-Fi 隔离。</p>
           </div>
@@ -71,7 +72,7 @@
 
         <p class="service-note reveal delay-3">
           <span aria-hidden="true">※</span>
-          默认浏览器直连；直连失败时，只有双方确认才会改走本机内存中转。
+          <span id="home-relay-policy">正在检查本地中转是否可用…</span>
         </p>
       </section>
 
@@ -83,6 +84,15 @@
             <h2 id="sender-title">选择要发送的文件</h2>
             <p id="sender-subtitle">先装载货单，再生成只用一次的接收码。</p>
           </div>
+          <ol id="sender-route-timeline" class="route-timeline" aria-label="连接进度" hidden>
+            <li data-step="signal">连接配对站</li><li data-step="approval">等待发送方批准</li>
+            <li data-step="route">寻找局域网路线</li><li data-step="verify">验证通道</li><li data-step="ready">可以传输</li>
+          </ol>
+          <div class="diagnostic-tools" hidden id="sender-diagnostic-tools">
+            <span id="sender-phase-status" role="status"></span>
+            <button id="copy-diagnostic-button" class="text-button" type="button">复制诊断</button>
+          </div>
+          <p id="sender-error" class="inline-error" role="alert" hidden></p>
 
           <div id="sender-prepare" class="sender-stage">
             <label id="send-dropzone" class="drop-ticket" for="send-file-input">
@@ -143,29 +153,21 @@
               <div><strong>等待对方确认文件</strong><small>连接已加密 · 文件尚未开始发送</small></div>
             </div>
 
-            <ol id="sender-route-timeline" class="route-timeline" aria-label="连接进度" hidden>
-              <li class="done">连接配对站</li>
-              <li class="done">等待发送方批准</li>
-              <li class="active">寻找局域网路线</li>
-              <li>验证通道</li>
-              <li>可以传输</li>
-            </ol>
-
             <div id="sender-route-failed" class="route-decision" hidden>
               <div class="decision-code">DIRECT_TIMEOUT · 20.0s</div>
               <h3>直连没有建立</h3>
               <p>可能与 TUN / VPN、访客 Wi-Fi 或防火墙有关。渡口没有自动改路，也还没有发送文件内容。</p>
+              <p id="relay-disabled-notice" hidden>本地中转已关闭或不可用，可重试直连或联系运行渡口的人。</p>
               <div class="button-row">
-                <button id="use-relay-button" class="primary-button" type="button">改用本地中转</button>
+                <button id="use-relay-button" class="primary-button" type="button" hidden disabled>改用本地中转</button>
                 <button id="retry-direct-button" class="secondary-button" type="button">重试直连</button>
-                <button id="copy-diagnostic-button" class="text-button" type="button">复制诊断</button>
               </div>
             </div>
 
             <div id="sender-relay-pending" class="relay-consent" role="status" hidden>
               <p class="tiny-label">ROUTE CHANGE REQUESTED</p>
               <h3>等待接收方同意改路</h3>
-              <p>文件将以加密数据经过这台渡口电脑的内存，不会落盘。对方同意前仍为 0 B。</p>
+              <p>文件密文将经过运行渡口服务的电脑内存，不会落盘。对方同意前仍为 0 B。</p>
             </div>
 
             <div id="sender-progress" class="progress-ticket" hidden>
@@ -175,14 +177,12 @@
               </div>
               <div class="progress-metrics">
                 <div><small>当前文件</small><strong id="sender-progress-file">等待接收方确认</strong></div>
-                <div><small>已发送</small><strong id="sender-progress-bytes">0 B</strong></div>
+                <div><small>对方已接收</small><strong id="sender-progress-bytes">0 B</strong></div>
                 <div><small>当前速度</small><strong id="sender-current-speed">计算中</strong></div>
                 <div><small>平均 / 剩余</small><strong id="sender-average-eta">— / —</strong></div>
                 <div><small>已用时间</small><strong id="sender-elapsed">0 秒</strong></div>
               </div>
             </div>
-
-            <p id="sender-error" class="inline-error" role="alert" hidden></p>
 
             <button class="danger-link" type="button" data-action="cancel-session">关闭这次传输</button>
           </div>
@@ -199,7 +199,7 @@
             <div><dt>服务端文件留存</dt><dd>无</dd></div>
             <div><dt>中转回退</dt><dd id="sender-relay-fact">仅双方确认后</dd></div>
           </dl>
-          <p class="board-warning"><b>同一局域网限定</b>无法直连时先明确停止；只有双方确认，才会改走本机内存中转。</p>
+          <p class="board-warning"><b>同一局域网限定</b>无法直连时先明确停止；只有双方确认，才会经过运行渡口服务的电脑内存中转。</p>
         </aside>
       </section>
 
@@ -210,6 +210,14 @@
             <p class="kicker">02 / 接件口</p>
             <h2 id="receiver-title">输入发送方的接收码</h2>
             <p id="receiver-subtitle">接收码只负责找到这趟传输，文件仍需你确认。</p>
+          </div>
+          <ol id="receiver-route-timeline" class="route-timeline" aria-label="连接进度" hidden>
+            <li data-step="signal">连接配对站</li><li data-step="approval">等待发送方批准</li>
+            <li data-step="route">寻找局域网路线</li><li data-step="verify">验证通道</li><li data-step="ready">可以传输</li>
+          </ol>
+          <div class="diagnostic-tools" hidden id="receiver-diagnostic-tools">
+            <span id="receiver-phase-status" role="status"></span>
+            <button id="receiver-copy-diagnostic-button" class="text-button" type="button">复制诊断</button>
           </div>
 
           <div id="receiver-code-stage" class="receiver-stage">
@@ -242,8 +250,8 @@
             <div class="relay-consent relay-consent-receiver">
               <p class="tiny-label">ROUTE CHANGE / NEEDS YOUR APPROVAL</p>
               <div class="relay-route-badge">本地中转</div>
-              <h3>发送方希望改走这台渡口电脑</h3>
-              <p>直连没有成功。文件密文会经过运行渡口的电脑内存，不会落盘；这条路径的安全边界弱于浏览器直连。</p>
+              <h3>发送方希望改用本地中转</h3>
+              <p>直连没有成功。文件密文会经过运行渡口服务的电脑内存，不会落盘；这条路径的安全边界弱于浏览器直连。</p>
               <dl class="consent-facts">
                 <div><dt>已发送文件内容</dt><dd>0 B</dd></div>
                 <div><dt>服务端留存</dt><dd>无</dd></div>
@@ -251,7 +259,7 @@
               </dl>
               <div class="button-row">
                 <button id="approve-relay-button" class="primary-button" type="button">允许本地中转</button>
-                <button id="reject-relay-button" class="secondary-button" type="button">拒绝并结束</button>
+                <button id="reject-relay-button" class="secondary-button" type="button">拒绝本次中转</button>
               </div>
             </div>
           </div>
@@ -321,6 +329,12 @@
     </footer>
 
     <div id="live-region" class="sr-only" aria-live="polite"></div>
+    <dialog id="copy-fallback-dialog" class="copy-fallback" aria-labelledby="copy-fallback-title">
+      <h2 id="copy-fallback-title">手动复制</h2>
+      <p>浏览器未允许自动复制。下方文字已选中，可按 Ctrl+C（Mac 为 ⌘C）复制。</p>
+      <textarea id="copy-fallback-text" readonly aria-label="待复制内容" spellcheck="false"></textarea>
+      <form method="dialog"><button class="secondary-button" type="submit">关闭</button></form>
+    </dialog>
     <div id="shutdown-notice" class="shutdown-notice" role="status" hidden>
       <span class="arrival-stamp">CLOSED</span>
       <h2>渡口已关闭</h2>

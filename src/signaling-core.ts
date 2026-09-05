@@ -1,4 +1,5 @@
 export interface SignalingConfig {
+  relayEnabled?: boolean;
   roomTtlMs: number;
   maxMessageBytes: number;
   joinRateLimit: {
@@ -50,10 +51,13 @@ export type SignalingAction =
   | { kind: "close"; peerId: string; code: number; reason: string }
   | {
       kind: "authorize_relay";
+      roomCode: string;
       sessionId: string;
       senderToken: string;
       receiverToken: string;
-    };
+      clientKeys: string[];
+    }
+  | { kind: "revoke_relay"; roomCode: string; sessionId: string };
 
 interface Peer {
   id: string;
@@ -69,6 +73,7 @@ interface Room {
   receiverId?: string;
   expiresAt?: number;
   relayRequested?: boolean;
+  relaySessionId?: string;
 }
 
 export class SignalingCore {
@@ -127,7 +132,9 @@ export class SignalingCore {
     const otherIds = [room.senderId, room.pendingReceiverId, room.receiverId].filter(
       (id): id is string => Boolean(id) && id !== peerId,
     );
-    const actions: SignalingAction[] = [];
+    const actions: SignalingAction[] = room.relaySessionId
+      ? [{ kind: "revoke_relay", roomCode: room.code, sessionId: room.relaySessionId }]
+      : [];
     for (const otherId of new Set(otherIds)) {
       const other = this.peers.get(otherId);
       if (other?.roomCode === room.code) {
@@ -395,8 +402,11 @@ export class SignalingCore {
     }
 
     if (message.type === "request_relay") {
+      if (this.config.relayEnabled === false) {
+        return [this.error(peerId, "RELAY_DISABLED", "本地中转已关闭，请使用局域网直连")];
+      }
       const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
-      if (!room?.receiverId || room.senderId !== peerId || room.relayRequested) {
+      if (!room?.receiverId || room.senderId !== peerId || room.relayRequested || room.relaySessionId) {
         return [this.error(peerId, "STATE_CONFLICT", "当前不能申请本地中转")];
       }
       room.relayRequested = true;
@@ -413,17 +423,24 @@ export class SignalingCore {
     }
 
     if (message.type === "approve_relay") {
+      if (this.config.relayEnabled === false) {
+        return [this.error(peerId, "RELAY_DISABLED", "本地中转已关闭，请使用局域网直连")];
+      }
       const room = peer.roomCode ? this.rooms.get(peer.roomCode) : undefined;
       const nextCredential = this.dependencies.nextRelayCredential;
-      if (!room?.relayRequested || room.receiverId !== peerId || !nextCredential) {
+      if (!room?.relayRequested || room.receiverId !== peerId || room.relaySessionId || !nextCredential) {
         return [this.error(peerId, "RELAY_UNAVAILABLE", "本地中转目前不可用")];
       }
       room.relayRequested = false;
       const sessionId = nextCredential();
       const senderToken = nextCredential();
       const receiverToken = nextCredential();
+      room.relaySessionId = sessionId;
       return [
-        { kind: "authorize_relay", sessionId, senderToken, receiverToken },
+        {
+          kind: "authorize_relay", roomCode: room.code, sessionId, senderToken, receiverToken,
+          clientKeys: [...new Set([this.peers.get(room.senderId)!.clientKey, peer.clientKey])],
+        },
         {
           kind: "send",
           peerId: room.senderId,
@@ -454,6 +471,22 @@ export class SignalingCore {
     return [this.error(peerId, "INVALID_MESSAGE", "未知的信令命令")];
   }
 
+  relayEnded(roomCode: string, sessionId: string, errorCode?: string): SignalingAction[] {
+    const room = this.rooms.get(roomCode);
+    if (!room || room.relaySessionId !== sessionId) return [];
+    room.relaySessionId = undefined;
+    room.relayRequested = false;
+    if (!errorCode) return [];
+    const message = errorCode === "RELAY_TIMEOUT"
+      ? "本地中转等待超时，请重新连接"
+      : errorCode === "RELAY_LIMIT"
+        ? "本地中转已达到容量限制，请稍后重试"
+        : "本地中转连接已关闭，请重新连接";
+    return [room.senderId, room.receiverId]
+      .filter((id): id is string => Boolean(id))
+      .map((id) => this.error(id, errorCode, message));
+  }
+
   private expireRoom(room: Room): SignalingAction[] {
     this.rooms.delete(room.code);
     const participantIds = [
@@ -461,7 +494,9 @@ export class SignalingCore {
       room.pendingReceiverId,
       room.receiverId,
     ].filter((id): id is string => Boolean(id));
-    const actions: SignalingAction[] = [];
+    const actions: SignalingAction[] = room.relaySessionId
+      ? [{ kind: "revoke_relay", roomCode: room.code, sessionId: room.relaySessionId }]
+      : [];
     for (const participantId of new Set(participantIds)) {
       const participant = this.peers.get(participantId);
       if (participant?.roomCode === room.code) {

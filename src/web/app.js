@@ -15,7 +15,9 @@
   let expiryTimer = null;
   let session = null;
   let sessionRole = null;
-  let sessionConnection = null;
+  let sessionScope = null;
+  let relayEnabled = isDemo;
+  let runtimeVersion = isDemo ? "0.2.0" : "unknown";
   let realModules = null;
   let senderEngine = null;
   let receiverEngine = null;
@@ -23,13 +25,126 @@
   let roomActive = false;
   const metricsByPrefix = new Map();
   const lastProgressPaint = new Map();
-  let isCleaningUp = false;
+  const lastDiagnostics = new Map();
   let unloadCleanupStarted = false;
   const objectUrls = new Set();
   const TERMINAL_TRANSFER_STATES = new Set(["completed", "rejected", "cancelled", "failed"]);
 
   function announce(message) {
     liveRegion.textContent = message;
+  }
+
+  async function copyText(text, button, success = "已复制") {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      button.textContent = success;
+      announce(success);
+    } catch {
+      const dialog = byId("copy-fallback-dialog");
+      const field = byId("copy-fallback-text");
+      field.value = text;
+      if (!dialog.open) dialog.showModal();
+      field.focus();
+      field.select();
+      announce("无法自动复制，已展示可手动复制的内容");
+    }
+  }
+
+  const PHASE_INDEX = {
+    idle: 0, connecting_signal: 0, waiting_peer: 1, joining_room: 1, waiting_approval: 1,
+    finding_route: 2, verifying_channel: 3, ready: 4,
+    relay_pending: 2, relay_connecting: 3, relay_ready: 4,
+    transferring: 4, completed: 4, cancelled: 4,
+  };
+  const PHASE_LABEL = {
+    idle: "尚未开始连接", connecting_signal: "正在连接配对站", waiting_peer: "等待另一台电脑加入",
+    waiting_approval: "等待发送方批准", finding_route: "正在寻找局域网路线",
+    joining_room: "正在查找这趟传输",
+    verifying_channel: "正在验证直连通道", ready: "直连已验证，等待确认文件",
+    relay_pending: "等待双方确认本地中转", relay_connecting: "正在验证中转加密通道",
+    relay_ready: "中转已建立，等待确认文件", transferring: "正在传输", completed: "文件已全部接收",
+    cancelled: "本次传输已结束", direct_failed: "直连未成功", failed: "本次连接或传输失败",
+  };
+  const UI_ERROR_CODES = new Set([
+    "RELAY_DECLINED", "RELAY_DISABLED", "RELAY_UNAVAILABLE", "RELAY_LIMIT", "RELAY_TIMEOUT",
+    "RELAY_AUTH_FAILED", "RELAY_CLOSED", "RELAY_PROTOCOL_ERROR", "RELAY_HANDSHAKE_FAILED",
+    "RELAY_CONNECT_FAILED", "TRANSFER_FAILED", "PEER_LEFT", "SIGNAL_OFFLINE", "PEER_REJECTED",
+    "DIRECT_CONNECTION_FAILED", "DIRECT_CONNECTION_CLOSED", "DIRECT_CHANNEL_CLOSED", "DIRECT_CHANNEL_ERROR",
+    "DIRECT_TIMEOUT", "DIRECT_UNSAFE_ROUTE", "DIRECT_STATS_UNAVAILABLE", "RTC_NEGOTIATION_FAILED",
+  ]);
+
+  function diagnosticFor(scope) {
+    const peer = scope.peer?.getDiagnosticSnapshot();
+    if (!peer) return lastDiagnostics.get(scope.role);
+    const overlay = scope.diagnosticPhase;
+    if (!overlay) return peer;
+    const elapsed = overlay.terminal ? overlay.elapsedMs : Math.max(0, Math.round(performance.now() - overlay.at));
+    return {
+      ...peer, stage: overlay.stage, elapsedMs: elapsed,
+      totalElapsedMs: overlay.totalElapsedMs + (overlay.terminal ? 0 : elapsed),
+      failedStage: overlay.failedStage, errorCode: overlay.errorCode,
+    };
+  }
+
+  function renderTimeline(role, snapshot) {
+    if (!snapshot) return;
+    lastDiagnostics.set(role, snapshot);
+    const timeline = byId(`${role}-route-timeline`);
+    const failed = snapshot.stage === "direct_failed" || snapshot.stage === "failed";
+    const index = PHASE_INDEX[failed ? snapshot.failedStage : snapshot.stage] ?? 0;
+    const ready = ["ready", "relay_ready", "transferring", "completed"].includes(snapshot.stage);
+    timeline.hidden = snapshot.stage === "idle";
+    for (const [position, item] of [...timeline.children].entries()) {
+      item.className = position < index || (ready && position === index) ? "done"
+        : position === index ? (failed ? "failed" : "active") : "";
+      if (position === index && !failed && !ready) item.setAttribute("aria-current", "step");
+      else item.removeAttribute("aria-current");
+    }
+    const relay = snapshot.stage.startsWith("relay_") || sessionScope?.role === role && sessionScope?.relayActive;
+    timeline.querySelector('[data-step="route"]').textContent = relay ? "双方确认本地中转" : "寻找局域网路线";
+    timeline.querySelector('[data-step="verify"]').textContent = relay ? "验证中转加密通道" : "验证通道";
+    byId(`${role}-diagnostic-tools`).hidden = false;
+    byId(`${role}-phase-status`).textContent = `${PHASE_LABEL[snapshot.stage] ?? "连接状态未知"}${snapshot.errorCode ? ` · ${snapshot.errorCode}` : ""}`;
+  }
+
+  function recordUiPhase(scope, stage, code = null) {
+    if (!isCurrentScope(scope)) return;
+    const previous = diagnosticFor(scope);
+    const terminal = ["failed", "completed", "cancelled"].includes(stage);
+    scope.diagnosticPhase = {
+      stage, at: performance.now(), terminal,
+      elapsedMs: terminal ? previous?.elapsedMs ?? 0 : 0,
+      totalElapsedMs: previous?.totalElapsedMs ?? 0,
+      failedStage: stage === "failed" ? previous?.stage ?? "idle" : null,
+      errorCode: code ? (UI_ERROR_CODES.has(code) ? code : "UNKNOWN") : null,
+    };
+    renderTimeline(scope.role, diagnosticFor(scope));
+  }
+
+  function browserFamily() {
+    const ua = navigator.userAgent;
+    return /Edg\//.test(ua) ? "Edge" : /Chrom(e|ium)\//.test(ua) ? "Chromium"
+      : /Firefox\//.test(ua) ? "Firefox" : /Safari\//.test(ua) ? "Safari" : "unknown";
+  }
+
+  function osFamily() {
+    const ua = navigator.userAgent;
+    return /Windows/.test(ua) ? "Windows" : /Android/.test(ua) ? "Android"
+      : /iPhone|iPad/.test(ua) ? "iOS" : /Macintosh|Mac OS X/.test(ua) ? "macOS"
+      : /Linux/.test(ua) ? "Linux" : "unknown";
+  }
+
+  function copyDiagnostic(role, button) {
+    const snapshot = sessionScope?.role === role ? diagnosticFor(sessionScope) : lastDiagnostics.get(role);
+    if (!snapshot && !isDemo) return;
+    const diagnostic = {
+      version: runtimeVersion, os: osFamily(), browser: browserFamily(),
+      ...(snapshot ?? { stage: "direct_failed", failedStage: "finding_route", elapsedMs: 20_000,
+        totalElapsedMs: 20_000, signalingState: "online", iceState: "unknown", connectionState: "unknown",
+        localCandidateType: "unknown", remoteCandidateType: "unknown", errorCode: "DIRECT_TIMEOUT" }),
+    };
+    void copyText(JSON.stringify(diagnostic, null, 2), button, "诊断已复制");
   }
 
   async function cleanupSink(sink) {
@@ -116,7 +231,7 @@
     list.classList.remove("empty-list");
     const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
     summary.textContent = `${selectedFiles.length} 个文件 · ${formatBytes(total)}`;
-    createButton.disabled = false;
+    createButton.disabled = sessionScope?.roomRequested === true;
     selectedFiles.forEach((file, index) => {
       list.append(
         createFileRow(file, true, () => {
@@ -169,7 +284,13 @@
     }
     if (event.code === "RTC_NEGOTIATION_FAILED") return "无法建立局域网直连";
     if (event.code === "DIRECT_TIMEOUT") return "20 秒内未能建立局域网直连";
-    if (event.code === "RELAY_UNAVAILABLE") return "本地中转目前不可用";
+    if (event.code === "DIRECT_UNSAFE_ROUTE") return "直连路线未通过验证";
+    if (event.code === "DIRECT_STATS_UNAVAILABLE") return "无法验证这条直连路线";
+    if (event.code?.startsWith("DIRECT_CONNECTION_") || event.code?.startsWith("DIRECT_CHANNEL_")) return "直连通道已中断";
+    if (event.code === "RELAY_UNAVAILABLE" || event.code === "RELAY_DISABLED") return "本地中转目前不可用";
+    if (event.code === "RELAY_LIMIT") return "本地中转已达到资源上限，请稍后重新连接";
+    if (event.code === "RELAY_TIMEOUT") return "本地中转等待超时，请重新连接";
+    if (event.code === "RELAY_AUTH_FAILED") return "中转数据校验失败，传输已停止，请重新连接";
     if (event.code === "INVALID_SERVER_MESSAGE") return "配对站返回了无法识别的信息";
     return "这次传输的状态已经变化，请返回后重试";
   }
@@ -195,26 +316,77 @@
     return realModules;
   }
 
-  async function ensureSession(role) {
-    if (session && sessionRole === role && sessionConnection) {
-      await sessionConnection;
-      return session;
-    }
-    if (session) await releaseSession();
-    const modules = await loadRealModules();
+  function isCurrentScope(scope) {
+    return scope !== null && sessionScope === scope && !scope.controller.signal.aborted;
+  }
+
+  function requireCurrentScope(scope) {
+    if (!isCurrentScope(scope)) throw new DOMException("Session ended", "AbortError");
+  }
+
+  function ensureSession(role) {
+    if (sessionScope?.role === role && (
+      !sessionScope.peer || [0, 1].includes(sessionScope.peer.socket?.readyState)
+    )) return sessionScope.connection;
+    // Invalidate synchronously, before module imports or browser-storage cleanup can yield.
+    void releaseSession();
+    const scope = {
+      role,
+      controller: new AbortController(),
+      peer: null,
+      connection: null,
+      files: Object.freeze([]),
+      relays: new Set(),
+      relayOpening: false,
+      relayActive: false,
+      relayRequested: false,
+      directFailed: false,
+      directVerified: false,
+      transferStarted: false,
+      storageCheck: null,
+    };
+    sessionScope = scope;
     sessionRole = role;
-    const nextSession = new modules.PeerSession({
-      onEvent: (event) => {
-        if (session === nextSession) handleSessionEvent(event);
-      },
+    lastDiagnostics.delete(role);
+    byId(role === "sender" ? "copy-diagnostic-button" : "receiver-copy-diagnostic-button").textContent = "复制诊断";
+    scope.connection = (async () => {
+      const modules = await loadRealModules();
+      requireCurrentScope(scope);
+      const peer = new modules.PeerSession({
+        onEvent: (event) => {
+          if (isCurrentScope(scope)) handleSessionEvent(event);
+        },
+      });
+      scope.peer = peer;
+      session = peer;
+      await peer.connect();
+      requireCurrentScope(scope);
+      return peer;
+    })().catch((error) => {
+      if (!isCurrentScope(scope)) throw new DOMException("Session ended", "AbortError");
+      void releaseSession();
+      throw error;
     });
-    session = nextSession;
-    sessionConnection = session.connect();
+    return scope.connection;
+  }
+
+  function reportSessionError(role, error, message) {
+    if (error.name !== "AbortError") showError(role, message);
+  }
+
+  async function createRoomForFiles(files) {
+    const connection = ensureSession("sender");
+    const scope = sessionScope;
+    if (scope.roomRequested) return;
+    scope.roomRequested = true;
+    // A room owns its selection; later file-picker changes never alter its payload.
+    scope.files = Object.freeze([...files]);
+    const peer = await connection;
+    requireCurrentScope(scope);
     try {
-      await sessionConnection;
-      return session;
+      peer.createRoom();
     } catch (error) {
-      sessionConnection = null;
+      scope.roomRequested = false;
       throw error;
     }
   }
@@ -225,7 +397,7 @@
     byId("sender-title").textContent = "选择要发送的文件";
     clearErrors();
     announce("已进入发送文件");
-    if (!isDemo) void ensureSession("sender").catch(() => showError("sender", "暂时连接不上配对站"));
+    if (!isDemo) void ensureSession("sender").catch((error) => reportSessionError("sender", error, "暂时连接不上配对站"));
   }
 
   function enterReceiver() {
@@ -235,7 +407,7 @@
     clearErrors();
     byId("join-code").focus();
     announce("已进入接收文件");
-    if (!isDemo) void ensureSession("receiver").catch(() => showError("receiver", "暂时连接不上配对站"));
+    if (!isDemo) void ensureSession("receiver").catch((error) => reportSessionError("receiver", error, "暂时连接不上配对站"));
   }
 
   function isEngineActive(engine) {
@@ -253,52 +425,58 @@
     );
   }
 
-  async function cancelEngines() {
-    const activeSender = senderEngine;
-    const activeReceiver = receiverEngine;
-    const previousCleanupState = isCleaningUp;
-    isCleaningUp = true;
-    try {
-      activeSender?.cancel?.();
-      await activeReceiver?.cancel?.();
-    } catch {
-      // Transport failure must not prevent browser-storage cleanup.
-    } finally {
-      isCleaningUp = previousCleanupState;
-    }
+  function closeRelays(scope) {
+    for (const transport of scope?.relays ?? []) transport.close();
+    scope?.relays.clear();
   }
 
-  async function releaseSession({ graceMs = 75 } = {}) {
+  async function releaseSession() {
     if (expiryTimer) clearInterval(expiryTimer);
     expiryTimer = null;
+    const scope = sessionScope;
     const activeSession = session;
-    const receivedFiles = [...(receiverEngine?.receivedFiles ?? [])];
-    const shouldNotifyPeer = isEngineActive(senderEngine) || isEngineActive(receiverEngine);
-
-    await cancelEngines();
-    if (shouldNotifyPeer && graceMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, graceMs));
+    const activeSender = senderEngine;
+    const activeReceiver = receiverEngine;
+    const receivedFiles = [...(activeReceiver?.receivedFiles ?? [])];
+    const staleUrls = [...objectUrls];
+    if (scope) {
+      const diagnostic = diagnosticFor(scope);
+      if (diagnostic) lastDiagnostics.set(scope.role, diagnostic);
     }
 
+    sessionScope = null;
     session = null;
     sessionRole = null;
-    sessionConnection = null;
     senderEngine = null;
     receiverEngine = null;
     directChannel = null;
     roomActive = false;
-    activeSession?.leave();
-    await Promise.all(receivedFiles.map((entry) => cleanupSink(entry.sink)));
-    for (const url of objectUrls) URL.revokeObjectURL(url);
     objectUrls.clear();
+    metricsByPrefix.clear();
+    lastProgressPaint.clear();
+
+    let receiverCancellation;
+    try {
+      activeSender?.cancel?.();
+      receiverCancellation = activeReceiver?.cancel?.();
+    } catch {
+      // A broken transport must not prevent other resources from being released.
+    } finally {
+      scope?.controller.abort();
+      closeRelays(scope);
+      activeSession?.leave();
+      for (const url of staleUrls) URL.revokeObjectURL(url);
+    }
+    await Promise.allSettled([
+      receiverCancellation,
+      ...receivedFiles.map((entry) => cleanupSink(entry.sink)),
+    ]);
   }
 
   async function resetHome() {
     if (demoTimer) clearTimeout(demoTimer);
     if (progressTimer) clearInterval(progressTimer);
-    if (!isDemo) {
-      await releaseSession();
-    }
+    const cleanup = isDemo ? Promise.resolve() : releaseSession();
     selectedFiles = [];
     byId("send-file-input").value = "";
     renderSenderFiles();
@@ -306,9 +484,27 @@
     byId("join-room-button").disabled = true;
     byId("sender-progress").hidden = true;
     byId("sender-connected").hidden = true;
+    byId("sender-route-failed").hidden = true;
+    byId("sender-route-timeline").hidden = true;
+    byId("receiver-route-timeline").hidden = true;
+    byId("sender-diagnostic-tools").hidden = true;
+    byId("receiver-diagnostic-tools").hidden = true;
+    lastDiagnostics.clear();
+    byId("copy-fallback-dialog").close();
+    byId("copy-fallback-text").value = "";
+    byId("sender-relay-pending").hidden = true;
+    byId("sender-route-fact").textContent = "尚未建立";
+    byId("sender-encryption-fact").textContent = "尚未建立";
+    byId("sender-relay-fact").textContent = "未启用";
+    byId("receiver-route-fact").textContent = "尚未建立";
+    byId("receiver-encryption-fact").textContent = "尚未建立";
+    byId("receiver-connection-status").textContent = "等待连接";
+    byId("create-room-button").textContent = "生成接收码";
+    byId("copy-code-button").textContent = "复制接收码";
     clearErrors();
     showOnly(byId("home-screen"));
     announce("已返回首页");
+    await cleanup;
   }
 
   async function requestBackHome() {
@@ -362,7 +558,29 @@
     }, 650);
   }
 
-  async function renderReceiverManifest(manifest) {
+  function updateReceiveAcceptance(scope = sessionScope) {
+    if (!isCurrentScope(scope)) return;
+    byId("accept-files-button").disabled = !(
+      receiverEngine?.state === "awaiting_acceptance" &&
+      scope.storageCheck?.engine === receiverEngine &&
+      scope.storageCheck.capability?.allowed === true &&
+      (scope.directVerified || scope.relayActive)
+    );
+  }
+
+  async function renderReceiverManifest(manifest, scope = sessionScope, engine = receiverEngine) {
+    if (!isDemo && (!isCurrentScope(scope) || engine !== receiverEngine)) return;
+    const check = isDemo ? null : { engine, controller: new AbortController(), capability: null };
+    const abortCheck = () => check.controller.abort();
+    if (check) {
+      scope.storageCheck?.controller.abort();
+      scope.storageCheck = check;
+      scope.controller.signal.addEventListener("abort", abortCheck, { once: true });
+    }
+    const isCurrentCheck = () => isDemo || (
+      isCurrentScope(scope) && scope.storageCheck === check && engine === receiverEngine &&
+      engine.state === "awaiting_acceptance" && !check.controller.signal.aborted
+    );
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     const list = byId("receiver-file-list");
     list.replaceChildren(...files.map((file) => createFileRow(file)));
@@ -374,19 +592,37 @@
     const contract = document.querySelector(".storage-contract");
     acceptButton.disabled = true;
     contract.textContent = "正在检查这台浏览器的接收能力…";
-    const capability = isDemo
-      ? { mode: "memory", allowed: true, limitBytes: MAX_MEMORY_BYTES }
-      : await realModules.assessStorageCapability(files, navigator, MAX_MEMORY_BYTES);
-    if (!capability.allowed) {
-      contract.innerHTML = `<b>无法接收这批文件</b>${capability.code === "FILE_TOO_LARGE" ? "存在超过 256 MiB 的文件" : "本批文件总量超过 256 MiB"}；当前浏览器只能使用内存接收。`;
-      showError("receiver", "容量预检未通过，尚未接收任何文件内容");
-    } else {
-      contract.innerHTML = capability.mode === "opfs"
-        ? "<b>浏览器存储模式</b>本批将写入浏览器临时文件，完成后仍需手动保存。"
-        : "<b>内存接收模式</b>单个文件与本批总量上限均为 256 MiB；本批已通过容量预检。";
-      acceptButton.disabled = false;
+    try {
+      const capability = isDemo
+        ? { mode: "memory", allowed: true, limitBytes: MAX_MEMORY_BYTES }
+        : await realModules.assessStorageCapability(files, navigator, MAX_MEMORY_BYTES, { signal: check.controller.signal });
+      if (!isCurrentCheck()) return;
+      if (check) check.capability = capability;
+      if (!capability.allowed) {
+        const reason = capability.code === "FILE_TOO_LARGE"
+          ? `文件「${capability.fileName ?? "未命名文件"}」超过 256 MiB；当前只能使用内存接收。`
+          : capability.code === "BATCH_TOO_LARGE"
+            ? "本批文件总量超过 256 MiB；当前只能使用内存接收。"
+            : "浏览器临时存储检查或清理失败，请关闭本轮后重试。";
+        const label = document.createElement("b");
+        label.textContent = "无法接收这批文件";
+        contract.replaceChildren(label, document.createTextNode(reason));
+        showError("receiver", "存储预检未通过，尚未接收任何文件内容");
+      } else {
+        contract.innerHTML = capability.mode === "opfs"
+          ? "<b>浏览器存储模式</b>已通过临时写入检查；浏览器未提供精确容量，不保证整批剩余空间。完成后仍需手动保存。"
+          : "<b>内存接收模式</b>单个文件与本批总量上限均为 256 MiB；本批已通过容量预检。";
+        if (isDemo) acceptButton.disabled = false;
+        else updateReceiveAcceptance(scope);
+      }
+      announce("收到一份文件清单，请确认");
+    } catch (error) {
+      if (!isCurrentCheck()) return;
+      contract.textContent = "无法确认浏览器存储是否可用，尚未允许接收文件。请结束本轮后重试。";
+      showError("receiver", "存储预检失败，尚未接收任何文件内容");
+    } finally {
+      if (check) scope.controller.signal.removeEventListener("abort", abortCheck);
     }
-    announce("收到一份文件清单，请确认");
   }
 
   function renderDemoOffer() {
@@ -485,50 +721,80 @@
     elapsed.textContent = `${Math.floor(measurement.elapsedMs / 1_000)} 秒`;
   }
 
-  function setupReceiver(channel) {
-    if (receiverEngine) return;
-    receiverEngine = new realModules.ReceiverEngine(channel, {
-      createSink: (file) => realModules.createStorage({ ...file, maxMemoryBytes: MAX_MEMORY_BYTES, navigator }),
-      onManifest: (manifest) => void renderReceiverManifest(manifest),
-      onProgress: (progress) => updateProgress("receiver", progress),
+  function setupReceiver(channel, scope = sessionScope) {
+    if (!isCurrentScope(scope) || receiverEngine) return;
+    const engine = new realModules.ReceiverEngine(channel, {
+      createSink: async (file) => {
+        requireCurrentScope(scope);
+        if (engine !== receiverEngine || !scope.storageMode) throw new Error("Storage contract is not selected");
+        const sink = await realModules.createStorage({ ...file, mode: scope.storageMode, maxMemoryBytes: MAX_MEMORY_BYTES, navigator });
+        if (!isCurrentScope(scope) || engine !== receiverEngine || engine.state !== "receiving") {
+          try {
+            await sink.abort?.();
+          } finally {
+            await cleanupSink(sink);
+          }
+          throw new DOMException("Transfer ended", "AbortError");
+        }
+        return sink;
+      },
+      onManifest: (manifest) => void renderReceiverManifest(manifest, scope, engine),
+      onProgress: (progress) => {
+        if (isCurrentScope(scope) && engine === receiverEngine) updateProgress("receiver", progress);
+      },
       onState: (state) => {
+        if (!isCurrentScope(scope) || engine !== receiverEngine) return;
         if (state === "receiving") {
+          scope.transferStarted = true;
+          recordUiPhase(scope, "transferring");
           showReceiverStage(byId("receiver-progress"));
           byId("receiver-title").textContent = "正在摆渡";
         }
         if (state === "completed") {
           roomActive = false;
-          renderReceivedFiles(receiverEngine.receivedFiles);
+          recordUiPhase(scope, "completed");
+          renderReceivedFiles(engine.receivedFiles);
         }
         if (state === "rejected") roomActive = false;
-        if (state === "cancelled" && !isCleaningUp) {
+        if (state === "cancelled") {
           roomActive = false;
+          recordUiPhase(scope, "cancelled");
           showError("receiver", "发送方取消了这次传输");
+          closeRelays(scope);
         }
         if (state === "failed") {
           roomActive = false;
-          showError("receiver", "传输数据异常，本次传输已停止");
+          recordUiPhase(scope, "failed", scope.relayFailure?.code ?? "TRANSFER_FAILED");
+          showError("receiver", scope.relayFailure ? errorMessage(scope.relayFailure) : "传输数据异常，本次传输已停止");
+          closeRelays(scope);
         }
       },
     });
+    receiverEngine = engine;
   }
 
-  function setupSender(channel) {
-    if (senderEngine) return;
-    senderEngine = new realModules.SenderEngine(channel, {
-      onProgress: (progress) => updateProgress("sender", progress),
+  function setupSender(channel, scope = sessionScope) {
+    if (!isCurrentScope(scope) || senderEngine) return;
+    const engine = new realModules.SenderEngine(channel, {
+      onProgress: (progress) => {
+        if (isCurrentScope(scope) && engine === senderEngine) updateProgress("sender", progress);
+      },
       onState: (state) => {
+        if (!isCurrentScope(scope) || engine !== senderEngine) return;
         if (state === "awaiting_acceptance") {
           byId("sender-connected").hidden = false;
           byId("sender-connected").querySelector("strong").textContent = "等待对方确认文件";
         }
         if (state === "transferring") {
+          scope.transferStarted = true;
+          recordUiPhase(scope, "transferring");
           byId("sender-connected").hidden = true;
           byId("sender-progress").hidden = false;
           byId("sender-title").textContent = "正在摆渡";
         }
         if (state === "completed") {
           roomActive = false;
+          recordUiPhase(scope, "completed");
           byId("sender-progress").hidden = false;
           byId("sender-progress-percent").textContent = "100%";
           byId("sender-title").textContent = "文件已送达";
@@ -536,19 +802,29 @@
         }
         if (state === "rejected") {
           roomActive = false;
+          recordUiPhase(scope, "cancelled", "PEER_REJECTED");
           showError("sender", "对方没有接收这批文件");
         }
-        if (state === "cancelled" && !isCleaningUp) {
+        if (state === "cancelled") {
           roomActive = false;
+          recordUiPhase(scope, "cancelled");
           showError("sender", "接收方取消了这次传输");
         }
         if (state === "failed") {
           roomActive = false;
-          showError("sender", "文件传输失败，请重新开始");
+          recordUiPhase(scope, "failed", scope.relayFailure?.code ?? "TRANSFER_FAILED");
+          showError("sender", scope.relayFailure ? errorMessage(scope.relayFailure) : "文件传输失败，请重新开始");
+        }
+        if (TERMINAL_TRANSFER_STATES.has(state)) {
+          // Success closes from the sender only, after the receiver's final receipt.
+          closeRelays(scope);
         }
       },
     });
-    senderEngine.send(selectedFiles).catch(() => showError("sender", "文件传输失败，请重新开始"));
+    senderEngine = engine;
+    engine.send(scope.files).catch(() => {
+      if (isCurrentScope(scope) && engine === senderEngine && engine.state !== "failed") showError("sender", "文件传输失败，请重新开始");
+    });
   }
 
   function updateExpiry(expiresAt) {
@@ -568,17 +844,88 @@
     if (!hasActiveWork()) return;
     const failedRole = sessionRole;
     roomActive = false;
+    byId("use-relay-button").disabled = true;
+    byId("sender-connected").hidden = true;
+    byId("sender-relay-pending").hidden = true;
     if (failedRole === "receiver") {
       showReceiverStage(byId("receiver-code-stage"));
       byId("receiver-title").textContent = "这次连接已经结束";
     }
     showError(failedRole, message);
-    void releaseSession({ graceMs: 0 });
+    void releaseSession();
+  }
+
+  function canChangeRoute(scope) {
+    return isCurrentScope(scope) && !scope.transferStarted && scope.peer?.socket?.readyState === 1 &&
+      [senderEngine, receiverEngine].every((engine) => !engine || ["idle", "awaiting_acceptance"].includes(engine.state));
+  }
+
+  function retirePendingDirect(scope) {
+    scope.storageCheck?.controller.abort();
+    scope.storageCheck = null;
+    scope.storageMode = null;
+    scope.directVerified = false;
+    const previousEngines = [senderEngine, receiverEngine];
+    senderEngine = null;
+    receiverEngine = null;
+    directChannel = null;
+    byId("accept-files-button").disabled = true;
+    for (const engine of previousEngines) {
+      // No file acceptance has occurred. Retire locally without sending a user
+      // cancellation that would incorrectly end the surviving signaling room.
+      engine?.removeMessageListener?.();
+      engine?.removeCloseListener?.();
+      const ending = engine?.finishCancelled?.();
+      ending?.catch?.(() => {});
+    }
+  }
+
+  function handleDirectFailure(event) {
+    const scope = sessionScope;
+    if (!isCurrentScope(scope) || scope.relayRequested || scope.relayOpening || scope.relayActive || scope.directFailed) return;
+    if (["completed", "cancelled"].includes(scope.diagnosticPhase?.stage)) return;
+    if (!canChangeRoute(scope)) {
+      if (scope.diagnosticPhase?.stage !== "failed") recordUiPhase(scope, "failed", event.code);
+      stopAfterConnectionFailure("直连已中断，本次传输已结束；不会在传输中改走中转");
+      return;
+    }
+    scope.directFailed = true;
+    scope.directFailure = { code: event.code, elapsedMs: event.elapsedMs ?? null };
+    retirePendingDirect(scope);
+    byId("use-relay-button").disabled = !relayEnabled || !canChangeRoute(scope);
+    const message = errorMessage(event);
+    if (scope.role === "sender") {
+      byId("sender-connected").hidden = true;
+      byId("sender-route-failed").hidden = false;
+      byId("sender-route-failed").querySelector(".decision-code").textContent =
+        `${event.code}${Number.isFinite(event.elapsedMs) ? ` · ${(event.elapsedMs / 1_000).toFixed(1)}s` : ""}`;
+      byId("sender-route-fact").textContent = `${message} · 未改路`;
+    } else {
+      showReceiverStage(byId("receiver-searching"));
+      byId("receiver-title").textContent = "直连未成功，等待发送方选择";
+      byId("receiver-searching").querySelector("h3").textContent = message;
+      byId("receiver-searching").querySelector("p:last-child").textContent = "房间仍保持连接，等待发送方重试或申请本地中转";
+      byId("receiver-route-fact").textContent = "直连未成功 · 未改路";
+    }
+    announce(`${message}；尚未发送文件内容，可以重试或申请本地中转`);
   }
 
   function handleSessionEvent(event) {
+    if (event.type === "phase") {
+      if (sessionScope.diagnosticPhase) return;
+      const { type, ...snapshot } = event;
+      renderTimeline(sessionScope.role, snapshot);
+      return;
+    }
+    if ((sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive || sessionScope.directFailed) && (
+      event.type === "direct_connection" ||
+      (event.type === "error" && ["DIRECT_TIMEOUT", "RTC_NEGOTIATION_FAILED"].includes(event.code))
+    )) return;
     if (event.type === "signaling") {
       setStation(event.state);
+      if (event.state === "offline" && sessionScope.diagnosticPhase && !["completed", "cancelled", "failed"].includes(sessionScope.diagnosticPhase.stage)) {
+        recordUiPhase(sessionScope, "failed", "SIGNAL_OFFLINE");
+      }
       if (event.state === "offline" && roomActive && !directChannel) {
         stopAfterConnectionFailure("配对站连接已断开，请重新开始");
       }
@@ -636,32 +983,46 @@
       } else {
         byId("receiver-searching").querySelector("p:last-child").textContent = "连接比平时慢，最多等待 20 秒";
       }
+      byId(`${sessionRole}-phase-status`).textContent = "连接比平时慢，最多等待 20 秒；仍在验证局域网路线";
       announce("连接比平时慢，仍在寻找局域网路线");
       return;
     }
+    if (event.type === "direct_failed") {
+      handleDirectFailure(event);
+      return;
+    }
     if (event.type === "data_channel" && event.state === "open") {
+      if (sessionScope.directFailed || sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive) {
+        event.channel.close();
+        return;
+      }
       directChannel = event.channel;
       if (sessionRole === "receiver") setupReceiver(event.channel);
       return;
     }
     if (event.type === "data_channel" && event.state === "closed") {
-      stopAfterConnectionFailure("连接已断开，本次传输无法继续");
+      handleDirectFailure({ code: "DIRECT_CHANNEL_CLOSED" });
       return;
     }
     if (event.type === "peer_connection") {
+      if (sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive) return;
       if (event.state === "failed" || event.state === "closed") {
-        if (directChannel) stopAfterConnectionFailure("局域网直连已中断，本次传输无法继续");
-        else if (sessionRole === "sender") {
-          byId("sender-connected").hidden = true;
-          byId("sender-route-timeline").hidden = true;
-          byId("sender-route-failed").hidden = false;
-        }
+        handleDirectFailure({ code: "DIRECT_CONNECTION_FAILED" });
       } else if (event.state === "disconnected" && hasActiveWork()) {
         announce("局域网连接暂时中断，正在尝试恢复");
       }
       return;
     }
     if (event.type === "relay_requested") {
+      if (!canChangeRoute(sessionScope)) {
+        session?.rejectRelay();
+        return;
+      }
+      retirePendingDirect(sessionScope);
+      sessionScope.relayRequested = true;
+      session?.closeDirect();
+      recordUiPhase(sessionScope, "relay_pending");
+      byId("approve-relay-button").disabled = !relayEnabled;
       showReceiverStage(byId("receiver-relay-consent"));
       byId("receiver-title").textContent = "确认是否改走本地中转";
       byId("receiver-route-fact").textContent = "等待你确认改路";
@@ -669,6 +1030,8 @@
       return;
     }
     if (event.type === "relay_declined") {
+      sessionScope.relayRequested = false;
+      recordUiPhase(sessionScope, "failed", "RELAY_DECLINED");
       byId("sender-relay-pending").hidden = true;
       byId("sender-route-failed").hidden = false;
       showError("sender", "接收方拒绝了本地中转，本次仍未发送文件内容");
@@ -679,20 +1042,17 @@
       return;
     }
     if (event.type === "direct_path") {
-      if (!event.direct) {
-        if (sessionRole === "sender") {
-          byId("sender-connected").hidden = true;
-          byId("sender-route-failed").hidden = false;
-          byId("sender-route-fact").textContent = "直连路线未通过验证";
-        }
-        announce("直连路线未通过验证，尚未发送文件内容");
-        return;
-      }
+      if (sessionScope.directFailed || sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive) return;
+      // Failure is retired by the following direct_failed event, before RTC closes.
+      if (!event.direct) return;
+      sessionScope.directVerified = true;
       const routeFact = byId(sessionRole === "sender" ? "sender-route-fact" : "receiver-route-fact");
       const encryptionFact = byId(sessionRole === "sender" ? "sender-encryption-fact" : "receiver-encryption-fact");
       routeFact.textContent = "局域网直连";
       encryptionFact.textContent = "已建立";
       if (sessionRole === "sender" && directChannel) setupSender(directChannel);
+      if (sessionRole === "receiver") updateReceiveAcceptance(sessionScope);
+      if (sessionRole === "receiver") byId("receiver-connection-status").textContent = "局域网直连";
       return;
     }
     if (event.type === "room_expired") {
@@ -700,23 +1060,28 @@
       return;
     }
     if (event.type === "peer_left" || event.type === "room_closed") {
+      if (sessionScope.diagnosticPhase && !["completed", "cancelled", "failed"].includes(sessionScope.diagnosticPhase.stage)) recordUiPhase(sessionScope, "failed", "PEER_LEFT");
       stopAfterConnectionFailure("连接已断开，本次传输无法继续");
       return;
     }
     if (event.type === "error") {
       const message = errorMessage(event);
-      if (event.code === "DIRECT_TIMEOUT" && sessionRole === "sender") {
-        byId("sender-connected").hidden = true;
-        byId("sender-route-timeline").hidden = true;
-        byId("sender-route-failed").hidden = false;
-        byId("sender-route-fact").textContent = "直连超时 · 未改路";
-        announce("直连超时，尚未发送文件；可以重试或申请本地中转");
-      } else if (event.code === "DIRECT_TIMEOUT" && sessionRole === "receiver") {
-        byId("receiver-searching").querySelector("h3").textContent = "直连未成功";
-        byId("receiver-searching").querySelector("p:last-child").textContent = "等待发送方重试或申请本地中转";
-      } else if (event.code === "RTC_NEGOTIATION_FAILED") {
-        stopAfterConnectionFailure(message);
+      if (["DIRECT_TIMEOUT", "RTC_NEGOTIATION_FAILED"].includes(event.code)) {
+        handleDirectFailure(event);
       } else {
+        if (event.code?.startsWith("RELAY_")) {
+          recordUiPhase(sessionScope, "failed", event.code);
+          if (sessionScope.relayOpening || sessionScope.relayActive) {
+            sessionScope.relayFailure = event;
+            stopAfterConnectionFailure(message);
+            return;
+          }
+          if (sessionRole === "sender") {
+            sessionScope.relayRequested = false;
+            byId("sender-relay-pending").hidden = true;
+            byId("sender-route-failed").hidden = false;
+          }
+        }
         if (
           sessionRole === "receiver" &&
           (event.code === "ROOM_UNAVAILABLE" || event.code === "RATE_LIMITED")
@@ -730,26 +1095,54 @@
   }
 
   async function openRelayTransport(event) {
+    const scope = sessionScope;
+    if (!isCurrentScope(scope) || !relayEnabled || scope.relayOpening || scope.relayActive) return;
+    if (senderEngine || receiverEngine) {
+      showError(scope.role, "当前传输已选择路线，请结束后再申请中转");
+      return;
+    }
+    scope.peer.closeDirect();
+    scope.relayOpening = true;
+    recordUiPhase(scope, "relay_connecting");
+    let transport;
     try {
       const modules = await loadRealModules();
-      const transport = new modules.RelayTransport({ token: event.token });
-      await transport.connect();
+      requireCurrentScope(scope);
+      transport = new modules.RelayTransport({ token: event.token });
+      scope.relays.add(transport);
+      transport.addEventListener("close", (closeEvent) => {
+        scope.relays.delete(transport);
+        scope.relayFailure = closeEvent;
+      });
+      transport.addEventListener("error", (errorEvent) => { scope.relayFailure = errorEvent; });
+      await transport.connect({ signal: scope.controller.signal });
+      requireCurrentScope(scope);
+      if (transport.readyState !== "open") throw new Error("relay closed during setup");
+      scope.relayOpening = false;
+      scope.relayActive = true;
       directChannel = transport;
-      if (sessionRole === "sender") {
+      recordUiPhase(scope, "relay_ready");
+      if (scope.role === "sender") {
         byId("sender-relay-pending").hidden = true;
         byId("sender-route-fact").textContent = "本地中转";
         byId("sender-encryption-fact").textContent = "应用层加密";
         byId("sender-relay-fact").textContent = "双方已确认";
-        setupSender(transport);
+        setupSender(transport, scope);
       } else {
         byId("receiver-route-fact").textContent = "本地中转";
         byId("receiver-encryption-fact").textContent = "应用层加密";
         byId("receiver-connection-status").textContent = "本地中转";
-        setupReceiver(transport);
+        setupReceiver(transport, scope);
       }
       announce("本地中转加密通道已建立");
-    } catch {
-      showError(sessionRole, "本地中转加密通道建立失败");
+    } catch (error) {
+      transport?.close();
+      scope.relays.delete(transport);
+      if (!isCurrentScope(scope)) return;
+      scope.relayOpening = false;
+      recordUiPhase(scope, "failed", error.code ?? "RELAY_UNAVAILABLE");
+      byId("sender-relay-pending").hidden = true;
+      stopAfterConnectionFailure(error.code ? errorMessage(error) : "本地中转加密通道建立失败，请重新连接");
     }
   }
 
@@ -802,15 +1195,7 @@
   function bestEffortPageExitCleanup() {
     if (isDemo || unloadCleanupStarted) return;
     unloadCleanupStarted = true;
-    senderEngine?.cancel?.();
-    const cancellation = receiverEngine?.cancel?.();
-    if (cancellation && typeof cancellation.catch === "function") {
-      cancellation.catch(() => {});
-    }
-    for (const entry of receiverEngine?.receivedFiles ?? []) {
-      void cleanupSink(entry.sink);
-    }
-    session?.leave();
+    void releaseSession();
   }
 
   byId("choose-sender").addEventListener("click", enterSender);
@@ -850,13 +1235,18 @@
     button.disabled = true;
     button.textContent = "正在生成接收码…";
     clearErrors();
+    const creation = createRoomForFiles([...selectedFiles]);
+    const scope = sessionScope;
     try {
-      (await ensureSession("sender")).createRoom();
-    } catch {
-      showError("sender", "暂时无法生成接收码，请稍后重试");
-      button.disabled = false;
+      await creation;
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        showError("sender", "暂时无法生成接收码，请稍后重试");
+        button.disabled = false;
+        button.textContent = "生成接收码";
+      }
     } finally {
-      button.textContent = "生成接收码";
+      if (isCurrentScope(scope)) button.textContent = "生成接收码";
     }
   });
 
@@ -874,6 +1264,14 @@
   });
 
   byId("use-relay-button").addEventListener("click", () => {
+    if (!relayEnabled) return;
+    if (!isDemo) {
+      if (!canChangeRoute(sessionScope) || !sessionScope.directFailed) return;
+      retirePendingDirect(sessionScope);
+      sessionScope.relayRequested = true;
+      session.closeDirect();
+      recordUiPhase(sessionScope, "relay_pending");
+    }
     byId("sender-route-failed").hidden = true;
     byId("sender-relay-pending").hidden = false;
     byId("sender-route-fact").textContent = "本地中转 · 等待确认";
@@ -890,28 +1288,16 @@
       announce("已重新开始寻找局域网直连");
       return;
     }
-    void releaseSession({ graceMs: 0 })
-      .then(() => ensureSession("sender"))
-      .then((activeSession) => activeSession.createRoom())
-      .catch(() => showError("sender", "重试失败，暂时连接不上配对站"));
+    const retryFiles = [...(sessionScope?.files ?? selectedFiles)];
+    selectedFiles = retryFiles;
+    renderSenderFiles();
+    void releaseSession();
+    void createRoomForFiles(retryFiles)
+      .catch((error) => reportSessionError("sender", error, "重试失败，暂时连接不上配对站"));
   });
 
-  byId("copy-diagnostic-button").addEventListener("click", async () => {
-    const diagnostic = JSON.stringify({
-      version: "0.2.0",
-      error: "DIRECT_TIMEOUT",
-      stage: "direct_connecting",
-      elapsedMs: 20_000,
-      signaling: "online_before_timeout",
-    }, null, 2);
-    try {
-      await navigator.clipboard.writeText(diagnostic);
-      byId("copy-diagnostic-button").textContent = "诊断已复制";
-      announce("已复制不含房间码、IP 和文件名的诊断信息");
-    } catch {
-      announce("无法自动复制诊断，请检查浏览器剪贴板权限");
-    }
-  });
+  byId("copy-diagnostic-button").addEventListener("click", (event) => copyDiagnostic("sender", event.currentTarget));
+  byId("receiver-copy-diagnostic-button").addEventListener("click", (event) => copyDiagnostic("receiver", event.currentTarget));
 
   byId("approve-peer-button").addEventListener("click", () => {
     if (isDemo) approveDemoPeer();
@@ -942,78 +1328,144 @@
     const code = codeInput.value.replace(/\D/g, "");
     showReceiverStage(byId("receiver-searching"));
     byId("receiver-title").textContent = "正在查找这趟传输";
+    const connection = ensureSession("receiver");
+    const scope = sessionScope;
     try {
-      (await ensureSession("receiver")).joinRoom(code);
-    } catch {
+      const peer = await connection;
+      requireCurrentScope(scope);
+      peer.joinRoom(code);
+    } catch (error) {
+      if (error.name === "AbortError") return;
       showReceiverStage(byId("receiver-code-stage"));
       showError("receiver", "暂时连接不上配对站");
     }
   });
 
   byId("approve-relay-button").addEventListener("click", () => {
+    if (!relayEnabled) return;
     if (isDemo) renderDemoOffer();
-    else session?.approveRelay();
+    else {
+      byId("approve-relay-button").disabled = true;
+      showReceiverStage(byId("receiver-searching"));
+      byId("receiver-title").textContent = "正在建立本地中转";
+      byId("receiver-searching").querySelector("h3").textContent = "正在协商中转加密通道…";
+      byId("receiver-searching").querySelector("p:last-child").textContent = "连接建立后仍需确认文件清单，才会发送文件内容";
+      session?.approveRelay();
+    }
   });
   byId("reject-relay-button").addEventListener("click", () => {
     if (isDemo) void resetHome();
     else {
       session?.rejectRelay();
-      void resetHome();
+      sessionScope.relayRequested = false;
+      sessionScope.directFailed = true;
+      recordUiPhase(sessionScope, "failed", "RELAY_DECLINED");
+      showReceiverStage(byId("receiver-searching"));
+      byId("receiver-title").textContent = "已拒绝本次中转";
+      byId("receiver-searching").querySelector("h3").textContent = "房间仍保持连接";
+      byId("receiver-searching").querySelector("p:last-child").textContent = "尚未发送文件内容，等待发送方重试或再次申请中转；也可以返回首页结束本轮";
+      byId("receiver-route-fact").textContent = "中转已拒绝 · 未改路";
+      announce("已拒绝本次中转，房间仍保持连接");
     }
   });
 
   byId("accept-files-button").addEventListener("click", () => {
     if (isDemo) startDemoReceive();
-    else if (receiverEngine?.state === "awaiting_acceptance") receiverEngine.accept();
+    else if (receiverEngine?.state === "awaiting_acceptance") {
+      updateReceiveAcceptance();
+      if (byId("accept-files-button").disabled) return;
+      sessionScope.storageMode = sessionScope.storageCheck.capability.mode;
+      receiverEngine.accept();
+    }
     else showError("receiver", "这批文件已经不能接收，请重新连接");
   });
   byId("reject-files-button").addEventListener("click", () => {
     if (isDemo) void resetHome();
     else if (receiverEngine?.state === "awaiting_acceptance") {
+      const scope = sessionScope;
       receiverEngine.reject();
-      setTimeout(() => void resetHome(), 100);
+      setTimeout(() => {
+        if (isCurrentScope(scope)) void resetHome();
+      }, 100);
     } else showError("receiver", "这批文件的状态已经变化，请重新连接");
   });
   byId("cancel-transfer-button").addEventListener("click", () => void cancelCurrentTransfer());
   addEventListener("pagehide", bestEffortPageExitCleanup);
   addEventListener("beforeunload", bestEffortPageExitCleanup);
 
+  function renderRelayAvailability() {
+    byId("use-relay-button").hidden = !relayEnabled;
+    byId("use-relay-button").disabled = !relayEnabled;
+    byId("approve-relay-button").disabled = !relayEnabled;
+    byId("relay-disabled-notice").hidden = relayEnabled;
+    byId("home-relay-policy").textContent = relayEnabled
+      ? "默认浏览器直连；直连失败时，只有双方确认才会经过运行渡口服务的电脑内存中转。"
+      : "本地中转已关闭或不可用；当前仅使用浏览器直连。";
+  }
+
   async function initializeLanAccess() {
     const output = byId("lan-url");
     const button = byId("copy-lan-url");
-    let url = isDemo ? "http://192.168.31.73:3000" : "";
-    let canShutdown = false;
-    if (!isDemo) {
+    const list = byId("lan-address-list");
+    const status = byId("lan-access-status");
+    const note = byId("lan-url-note");
+    const validAddress = (value) => {
+      if (typeof value !== "string") return false;
       try {
+        const parsed = new URL(value);
+        return parsed.protocol === "http:" && /^\d+\.\d+\.\d+\.\d+$/.test(parsed.hostname) &&
+          !parsed.username && !parsed.password && parsed.pathname === "/" && !parsed.search && !parsed.hash;
+      } catch { return false; }
+    };
+    try {
+      let runtime = { version: "0.2.0", lanUrls: ["http://192.168.31.73:3000"], recommendedUrl: "http://192.168.31.73:3000", relayEnabled: true };
+      if (!isDemo) {
         const response = await fetch("/api/runtime", { cache: "no-store" });
-        if (response.ok) {
-          const runtime = await response.json();
-          url = runtime.recommendedUrl ?? "";
-          canShutdown = runtime.canShutdown === true;
+        if (!response.ok) throw new Error("runtime unavailable");
+        runtime = await response.json();
+      }
+      if (!Array.isArray(runtime.lanUrls) || !runtime.lanUrls.every(validAddress)) throw new Error("invalid address list");
+      runtimeVersion = typeof runtime.version === "string" && /^\d+\.\d+\.\d+$/.test(runtime.version) ? runtime.version : "unknown";
+      relayEnabled = runtime.relayEnabled === true;
+      byId("shutdown-service-button").hidden = runtime.canShutdown !== true;
+      const urls = [...new Set(runtime.lanUrls)].filter((url) => !new URL(url).hostname.startsWith("127."));
+      const recommended = urls.includes(runtime.recommendedUrl) ? runtime.recommendedUrl : urls[0];
+      if (!recommended) {
+        byId("access-title").textContent = "目前仅本机可用";
+        status.textContent = "目前仅本机可用：未找到局域网地址；localhost 只能在运行渡口服务的电脑上打开。";
+        output.textContent = validAddress(runtime.recommendedUrl) && new URL(runtime.recommendedUrl).hostname.startsWith("127.")
+          ? runtime.recommendedUrl : "仅本机地址，不能分享给另一台电脑";
+        note.textContent = "请连接可互访的 Wi-Fi 或网线网络后刷新；本机地址不能用于其他电脑。";
+        button.disabled = true;
+      } else {
+        status.textContent = "推荐地址 · 连接同一局域网后尝试打开；推荐不代表已验证可达。";
+        output.textContent = recommended;
+        button.disabled = false;
+        button.addEventListener("click", () => void copyText(recommended, button));
+        for (const url of urls.filter((value) => value !== recommended)) {
+          const row = document.createElement("li");
+          const address = document.createElement("output");
+          address.textContent = url;
+          const copy = document.createElement("button");
+          copy.type = "button";
+          copy.className = "text-button";
+          copy.dataset.copyLanUrl = url;
+          copy.textContent = "复制备选地址";
+          copy.addEventListener("click", () => void copyText(url, copy));
+          row.append(address, copy);
+          list.append(row);
         }
-      } catch {
-        // Runtime endpoint is delivered in the implementation batch; localhost remains usable meanwhile.
+        list.hidden = list.children.length === 0;
+        note.textContent = "候选来自不同网卡，可能包含虚拟网卡；打不开时可试备选，并检查防火墙、访客 Wi-Fi 隔离或 VPN/TUN。渡口不自动修改网络设置。";
       }
+    } catch {
+      byId("access-title").textContent = "暂时无法读取地址";
+      status.textContent = "地址信息读取失败，不代表电脑没有局域网地址。";
+      output.textContent = "请确认渡口服务仍在运行，然后刷新重试";
+      note.textContent = "也可查看运行渡口的终端所显示的地址；当前页面地址未被当作其他电脑可用的入口。";
+      button.disabled = true;
     }
-    if (!url && location.protocol !== "file:") url = location.origin;
-    if (!url) {
-      output.textContent = "暂未找到可访问的局域网地址";
-      return;
-    }
-    output.textContent = url;
-    button.disabled = false;
-    byId("shutdown-service-button").hidden = !canShutdown;
-    button.addEventListener("click", async () => {
-      try {
-        if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
-        await navigator.clipboard.writeText(url);
-        button.textContent = "已复制";
-      } catch {
-        output.setAttribute("tabindex", "0");
-        output.focus();
-        announce("无法自动复制，请手动复制地址");
-      }
-    });
+    renderRelayAvailability();
   }
 
   byId("shutdown-service-button").addEventListener("click", async () => {
@@ -1039,6 +1491,7 @@
   });
 
   renderSenderFiles();
+  renderRelayAvailability();
   setStation(isDemo ? "online" : "offline");
   void initializeLanAccess();
 })();

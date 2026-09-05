@@ -6,6 +6,8 @@
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
     "test": "bun test",
+    "test:browser": "python tests/run_browser_tests.py",
+    "smoke:binary": "bun scripts/smoke-binary.ts",
     "build": "bun build src/server.ts --target=bun --outdir dist",
     "compile": "bun build src/server.ts --compile --outfile dist/dukou",
     "compile:windows-x64": "bun build src/server.ts --compile --target=bun-windows-x64 --outfile dist/dukou-windows-x64.exe",
