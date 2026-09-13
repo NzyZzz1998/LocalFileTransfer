@@ -35,11 +35,31 @@ def open_demo(page, role: str) -> list[str]:
     return errors
 
 
+def verify_home(browser) -> None:
+    # A promotional block or oversized cards must not push the actual tasks
+    # below the first viewport, including the existing narrow layout.
+    for width, height in [(1280, 720), (390, 844)]:
+        page = browser.new_page(viewport={"width": width, "height": height})
+        try:
+            errors = open_demo(page, "sender")
+            for selector in ("#choose-sender", "#choose-receiver", "#copy-lan-url"):
+                control = page.locator(selector)
+                control.wait_for(state="visible")
+                bounds = control.bounding_box()
+                assert bounds and 0 <= bounds["y"] and bounds["y"] + bounds["height"] <= height, (
+                    f"{selector} must be available without scrolling at {width}x{height}: {bounds}"
+                )
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            page.screenshot(path=str(SCREENSHOTS / f"home-{width}.png"), full_page=True)
+            assert not errors, errors
+        finally:
+            page.close()
+
+
 def verify_sender(browser) -> None:
     page = browser.new_page(viewport={"width": 1440, "height": 960})
     errors = open_demo(page, "sender")
 
-    page.get_by_role("heading", name=re.compile("文件不过云.*只过桥")).wait_for()
     page.get_by_text("http://192.168.31.73:3000", exact=True).wait_for()
     page.get_by_role("button", name="发送文件").click()
     page.get_by_role("heading", name="选择要发送的文件").wait_for()
@@ -57,7 +77,7 @@ def verify_sender(browser) -> None:
     page.get_by_role("heading", name="直连没有建立").wait_for(timeout=5_000)
     page.get_by_text("DIRECT_TIMEOUT · 20.0s", exact=True).wait_for()
     page.get_by_role("button", name="改用本地中转").click()
-    page.get_by_role("heading", name="等待接收方同意改路").wait_for()
+    page.get_by_role("heading", name="等待接收方同意中转").wait_for()
     page.get_by_text("对方同意前仍为 0 B。", exact=False).wait_for()
     page.screenshot(path=str(SCREENSHOTS / "sender-desktop.png"), full_page=True)
     assert not errors, errors
@@ -79,7 +99,7 @@ def verify_receiver(browser) -> None:
     page.get_by_text("本批已通过容量预检", exact=False).wait_for()
     page.get_by_role("button", name="接收这些文件").click()
     page.get_by_role("heading", name="接收完成").wait_for(timeout=8_000)
-    page.get_by_role("button", name="保存 设计素材包.zip").wait_for()
+    page.get_by_role("button", name="演示保存 设计素材包.zip（不下载）").wait_for()
     page.screenshot(path=str(SCREENSHOTS / "receiver-narrow.png"), full_page=True)
     assert not errors, errors
     page.close()
@@ -170,6 +190,7 @@ def main() -> None:
         if browser_path:
             launch_options["executable_path"] = browser_path
         browser = playwright.chromium.launch(**launch_options)
+        verify_home(browser)
         verify_sender(browser)
         verify_receiver(browser)
         if runtime_url := os.environ.get("DUKOU_TEST_URL"):

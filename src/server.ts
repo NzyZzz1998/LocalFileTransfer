@@ -30,6 +30,8 @@ export interface ServerOptions {
   networkInterfaces?: () => NetworkInterfaces;
   relayEnabled?: boolean;
   relayConfig?: Partial<Omit<RelayHubOptions, "now"> & RelayQueueOptions>;
+  shutdownTimeoutMs?: number;
+  onShutdownComplete?: () => void;
 }
 
 interface SignalingSocketData {
@@ -44,6 +46,21 @@ interface RelaySocketData {
 }
 
 type SocketData = SignalingSocketData | RelaySocketData;
+
+type ShutdownStatus = "pending" | "ready" | "unsaved" | "cleanup_failed" | "unresponsive";
+type ShutdownResult = { ok: true } | {
+  ok: false;
+  code: "SHUTDOWN_UNSAVED_FILES" | "SHUTDOWN_CLEANUP_FAILED" | "SHUTDOWN_CLIENT_UNRESPONSIVE";
+};
+
+interface ShutdownAttempt {
+  requestId: string;
+  peers: Map<string, ShutdownStatus>;
+  promise: Promise<ShutdownResult>;
+  resolve: (result: ShutdownResult) => void;
+  timer?: ReturnType<typeof setTimeout>;
+  completed: boolean;
+}
 
 const signalingConfig: SignalingConfig = {
   roomTtlMs: 600_000,
@@ -116,13 +133,83 @@ export function startServer(options: ServerOptions = {}) {
   });
   const networkInterfaces = options.networkInterfaces ?? readNetworkInterfaces;
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
+  let shutdownAttempt: ShutdownAttempt | undefined;
   let stopped = false;
 
-  const stop = (closeActiveConnections?: boolean) => {
+  const stop = async (closeActiveConnections?: boolean) => {
     if (stopped) return;
     stopped = true;
     if (sweepTimer) clearInterval(sweepTimer);
-    bunServer.stop(closeActiveConnections);
+    if (shutdownTimer) clearTimeout(shutdownTimer);
+    if (shutdownAttempt && !shutdownAttempt.completed) finishShutdown(shutdownAttempt, true);
+    await bunServer.stop(closeActiveConnections);
+  };
+
+  const finishShutdown = (attempt: ShutdownAttempt, timedOut = false) => {
+    if (attempt.completed) return;
+    const statuses = [...attempt.peers.values()];
+    if (!timedOut && statuses.includes("pending")) return;
+    const code = statuses.includes("unsaved")
+      ? "SHUTDOWN_UNSAVED_FILES"
+      : statuses.includes("cleanup_failed")
+        ? "SHUTDOWN_CLEANUP_FAILED"
+        : timedOut || statuses.includes("unresponsive")
+          ? "SHUTDOWN_CLIENT_UNRESPONSIVE"
+          : undefined;
+    attempt.completed = true;
+    if (attempt.timer) clearTimeout(attempt.timer);
+    // Failed attempts release the admission gate so clients can save files and retry.
+    if (code) shutdownAttempt = undefined;
+    attempt.resolve(code ? { ok: false, code } : { ok: true });
+  };
+
+  const requestShutdown = (): Promise<ShutdownResult> => {
+    if (shutdownAttempt) return shutdownAttempt.promise;
+    const { promise, resolve } = Promise.withResolvers<ShutdownResult>();
+    const attempt: ShutdownAttempt = {
+      requestId: crypto.randomUUID(),
+      peers: new Map([...sockets.keys()].map((peerId) => [peerId, "pending"])),
+      promise,
+      resolve,
+      completed: false,
+    };
+    shutdownAttempt = attempt;
+    attempt.timer = setTimeout(() => finishShutdown(attempt, true), options.shutdownTimeoutMs ?? 10_000);
+    attempt.timer.unref();
+    const notice = JSON.stringify({ type: "service_shutdown", requestId: attempt.requestId });
+    for (const [peerId, socket] of sockets) {
+      try {
+        if (socket.send(notice) === 0) attempt.peers.set(peerId, "unresponsive");
+      } catch {
+        attempt.peers.set(peerId, "unresponsive");
+      }
+    }
+    finishShutdown(attempt);
+    return promise;
+  };
+
+  const receiveShutdownAck = (peerId: string, payload: string | Uint8Array): boolean => {
+    // Control frames have a narrow shape and cannot bypass signaling size/binary limits.
+    if (typeof payload !== "string" || payload.length > 256 ||
+      new TextEncoder().encode(payload).byteLength > Math.min(256, config.maxMessageBytes)) return false;
+    let message: unknown;
+    try {
+      message = JSON.parse(payload);
+    } catch {
+      return false;
+    }
+    if (typeof message !== "object" || message === null || !("type" in message) || message.type !== "shutdown_ack") return false;
+    const ack = message as Record<string, unknown>;
+    const attempt = shutdownAttempt;
+    if (Object.keys(ack).length === 3 && typeof ack.requestId === "string" &&
+      (ack.status === "ready" || ack.status === "unsaved" || ack.status === "cleanup_failed") &&
+      attempt && !attempt.completed && ack.requestId === attempt.requestId && attempt.peers.get(peerId) === "pending") {
+      attempt.peers.set(peerId, ack.status);
+      finishShutdown(attempt);
+    }
+    // Stale, duplicate, and malformed acknowledgements never reach room signaling.
+    return true;
   };
 
   const dispatch = (actions: SignalingAction[]) => {
@@ -192,10 +279,18 @@ export function startServer(options: ServerOptions = {}) {
           request.headers.get("origin") === requestUrl.origin &&
           request.headers.get("x-dukou-action") === "shutdown";
         if (!authorized) return secureResponse("Shutdown is only available locally", { status: 403 });
-        const shutdownTimer = setTimeout(() => stop(true), 75);
-        shutdownTimer.unref();
-        return secureResponse(JSON.stringify({ ok: true }), {
-          headers: { "Content-Type": "application/json; charset=utf-8" },
+        const result = await requestShutdown();
+        if (result.ok && !shutdownTimer) {
+          // Let all joined HTTP responses reach their callers before stopping the listener.
+          shutdownTimer = setTimeout(async () => {
+            await stop(true);
+            options.onShutdownComplete?.();
+          }, 75);
+          shutdownTimer.unref();
+        }
+        return secureResponse(JSON.stringify(result), {
+          status: result.ok ? 200 : 409,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
         });
       }
       if (request.method !== "GET") {
@@ -203,6 +298,9 @@ export function startServer(options: ServerOptions = {}) {
           status: 405,
           headers: { Allow: "GET" },
         });
+      }
+      if ((pathname === "/ws" || pathname === "/relay") && (shutdownAttempt || stopped)) {
+        return secureResponse("Service shutdown in progress", { status: 503, headers: { "Retry-After": "1" } });
       }
       if (pathname === "/relay") {
         if (!relayEnabled) return secureResponse("RELAY_DISABLED", { status: 503 });
@@ -263,6 +361,10 @@ export function startServer(options: ServerOptions = {}) {
     },
     websocket: {
       open(socket) {
+        if (shutdownAttempt || stopped) {
+          socket.close(1001, "Service shutdown in progress");
+          return;
+        }
         if (socket.data.kind === "signaling") {
           sockets.set(socket.data.peerId, socket);
           return;
@@ -308,6 +410,7 @@ export function startServer(options: ServerOptions = {}) {
             : message instanceof Uint8Array
               ? message
               : new Uint8Array(message);
+        if (receiveShutdownAck(socket.data.peerId, payload)) return;
         dispatch(core.receive(socket.data.peerId, payload));
       },
       drain(socket) {
@@ -325,6 +428,10 @@ export function startServer(options: ServerOptions = {}) {
           return;
         }
         sockets.delete(socket.data.peerId);
+        if (shutdownAttempt?.peers.get(socket.data.peerId) === "pending") {
+          shutdownAttempt.peers.set(socket.data.peerId, "unresponsive");
+          finishShutdown(shutdownAttempt);
+        }
         dispatch(core.disconnect(socket.data.peerId));
       },
       maxPayloadLength: Math.max(config.maxMessageBytes, relayConfig.maxFrameBytes),
@@ -349,7 +456,7 @@ export function startServer(options: ServerOptions = {}) {
       return { ...createRuntimeInfo(networkInterfaces(), bunServer.port, APP_VERSION), relayEnabled };
     },
     stop(closeActiveConnections?: boolean) {
-      stop(closeActiveConnections);
+      return stop(closeActiveConnections);
     },
   };
 }
@@ -360,7 +467,7 @@ if (import.meta.main) {
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new Error("PORT must be an integer between 0 and 65535");
   }
-  const server = startServer({ hostname, port });
+  const server = startServer({ hostname, port, onShutdownComplete: () => process.exit(0) });
   console.log(`渡口已启动：${server.url}`);
   if (server.runtime.lanUrls.length > 0) {
     console.log(`另一台电脑打开：${server.runtime.recommendedUrl}`);

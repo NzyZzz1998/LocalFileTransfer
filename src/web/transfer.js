@@ -194,7 +194,7 @@ export class SenderEngine {
       this.state === "awaiting_acceptance"
     ) {
       this.setState("transferring");
-      this.transmitFiles().catch((error) => this.fail(error));
+      this.processing = this.transmitFiles().catch((error) => this.fail(error));
       return;
     }
 
@@ -345,6 +345,15 @@ export class SenderEngine {
     this.finishCancelled();
   }
 
+  async dispose() {
+    this.removeMessageListener();
+    this.removeCloseListener();
+    this.cancel();
+    await this.processing;
+    this.files = [];
+    this.onProgress = this.onState = () => {};
+  }
+
   finishCancelled() {
     if (["completed", "rejected", "cancelled", "failed"].includes(this.state)) return;
     this.setState("cancelled");
@@ -407,12 +416,15 @@ export class ReceiverEngine {
   }
 
   async handleMessage(data) {
+    if (this.disposed) return;
     if (data instanceof ArrayBuffer) {
       if (this.state !== "receiving" || !this.currentFile) {
         throw new Error("received file bytes before a file was started");
       }
       const chunk = new Uint8Array(data);
-      await this.currentFile.sink.write(chunk);
+      const current = this.currentFile;
+      await current.sink.write(chunk);
+      if (this.disposed || this.state !== "receiving" || this.currentFile !== current) return;
       this.currentFile.receivedBytes += chunk.byteLength;
       const overallBytes = this.completedBytes() + this.currentFile.receivedBytes;
       this.reportProgress(
@@ -465,11 +477,12 @@ export class ReceiverEngine {
       if (!file || message.fileId !== file.id || message.size !== file.size || this.currentFile) {
         throw new Error("file start did not match the manifest");
       }
-      this.currentFile = {
-        file,
-        sink: await this.createSink(file),
-        receivedBytes: 0,
-      };
+      const sink = await this.createSink(file);
+      if (this.disposed || this.state !== "receiving") {
+        await sink.abort?.();
+        return;
+      }
+      this.currentFile = { file, sink, receivedBytes: 0 };
       this.reportProgress(file, this.nextFileIndex, 0, this.completedBytes());
       return;
     }
@@ -495,6 +508,7 @@ export class ReceiverEngine {
       }
 
       const result = await current.sink.finalize();
+      if (this.disposed || this.state !== "receiving" || this.currentFile !== current) return;
       const finalOverallBytes = this.completedBytes() + current.receivedBytes;
       this.sendAcknowledgement(finalOverallBytes, current);
       this.receivedFiles.push({ file: current.file, result, sink: current.sink });
@@ -585,6 +599,17 @@ export class ReceiverEngine {
     await this.finishCancelled();
   }
 
+  async dispose() {
+    this.disposed = true;
+    this.removeMessageListener();
+    this.removeCloseListener();
+    const cancellation = this.cancel();
+    const results = await Promise.allSettled([cancellation, this.processing]);
+    this.onManifest = this.onProgress = this.onState = () => {};
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
+  }
+
   async finishCancelled() {
     if (["completed", "rejected", "cancelled", "failed"].includes(this.state)) return;
     const sink = this.currentFile?.sink;
@@ -600,8 +625,10 @@ export class ReceiverEngine {
     if (this.currentFile?.sink.abort) {
       try {
         await this.currentFile.sink.abort();
-      } catch {
-        // Preserve the original protocol or transport failure.
+      } catch (cleanupError) {
+        // Preserve both facts: transfer diagnostics and storage still requiring
+        // cleanup. Otherwise the owner can disappear from shutdown coordination.
+        this.cleanupError = cleanupError;
       }
     }
     this.currentFile = undefined;

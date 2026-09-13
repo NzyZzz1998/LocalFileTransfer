@@ -8,11 +8,27 @@ v0.2 优先使用 WebRTC 点对点直连；协商或路线验证失败（最长�
 
 ## 本地运行
 
-安装 [Bun](https://bun.sh/) 1.3 或更高版本后：
+先安装 Git 和 [Bun](https://bun.sh/)（当前测试版本为 1.3.14）。最新 v0.2 候选在 `test` 分支，默认 `main` 尚未合并这些更新。
+
+首次在一台电脑上运行：
 
 ```bash
+git clone --branch test https://github.com/NzyZzz1998/LocalFileTransfer.git
+cd LocalFileTransfer
+bun install --frozen-lockfile
 bun start
 ```
+
+已经克隆过项目时，先确认本地修改已妥善保留，再切换并更新：
+
+```bash
+git switch test
+git pull --ff-only origin test
+bun install --frozen-lockfile
+bun start
+```
+
+更新前先正常关闭旧服务。只需要一台电脑运行 `bun start`，所有发送端和接收端都打开这台电脑显示的同一个局域网地址；无需每台电脑都克隆、安装依赖或分别启动服务。Windows/macOS/Linux 的源码启动命令相同，实际跨设备验证范围见下文。
 
 也可以编译为当前操作系统的单文件程序。Windows 示例：
 
@@ -28,6 +44,12 @@ bun run compile
 若另一台电脑无法打开页面，请确认两台设备位于可互访的同一局域网、没有使用隔离设备的访客 Wi-Fi，并允许系统防火墙放行 TCP 3000 端口。VPN/TUN 可能干扰 WebRTC 直连；v0.2 会在超时后提供双方确认的本地中转出口。
 
 运行服务的电脑通过 `localhost` 打开首页时，可以使用“关闭渡口服务”；局域网中的其他电脑看不到该入口，也不能远程调用关闭接口。
+
+关闭会通知各个传输页面停止直连/中转、心跳与计时器，并等待正在进行的文件操作和本页临时文件清理，再退出服务、释放端口。开发模式的文件监听进程也会退出。浏览器标签页和启动它的终端窗口不会被强行关闭；看到关闭成功后可自行关闭窗口。
+
+接收端仍有未保存文件时（包括多文件批次中已经收完的部分），会保留这些文件并暂停关闭。请先保存，或在接收端返回首页并明确确认放弃，再回到本机重试关闭。保存按钮只表示已交给浏览器下载，请检查浏览器下载结果。临时文件清理失败或页面未回应时也会明确提示，不会误报已关闭。
+
+清理只针对当前页面登记的渡口临时文件，不删除原文件、已下载文件或其他页面的存储。浏览器崩溃、强制结束进程、断电后遗留的历史存储不在正常关闭保证内；仅关闭标签页也不等于停止渡口服务。
 
 ### 只启用直连
 
@@ -106,7 +128,7 @@ python -m playwright install chromium
 bun run test:browser
 ```
 
-包括直连的中转开启/关闭配置、桌面/窄屏 UI、会话隔离、中转故障、存储异常和地址/诊断的 15 个场景。可用 `python tests/run_browser_tests.py --suite diagnostics` 单独运行一组；`--browser chromium` 强制使用 Playwright 配套浏览器。
+包括直连的中转开启/关闭配置、桌面/窄屏 UI、会话隔离、中转故障、存储异常、地址/诊断和完整关闭回归。可用 `python tests/run_browser_tests.py --suite shutdown` 单独验证关闭；每个关闭场景自建随机端口的服务，并检查进程正常退出与端口释放。`--browser chromium` 强制使用 Playwright 配套浏览器。
 
 在一个终端启动测试服务：
 
@@ -139,7 +161,7 @@ python tests/e2e_diagnostics_test.py --start-server --case all
 
 自动化已覆盖信令状态机、Origin 与安全头、真实 WebSocket、WebRTC 会话、8/20 秒超时、加密中转、篡改与重放拒绝、ACK 进度、OPFS/内存预检、浏览器下载字节一致性，以及桌面/窄屏 UI。Windows x64 单文件构建与原生产物启动、完整资源和安全关闭检查已通过。
 
-v0.2 的本次 Review 修复已完成本地实现与回归，仍为 **L2 候选，不是已验收发布版**。CI 已接入完整浏览器门禁和四平台原生产物 smoke；`test` 推送已获授权，实际远端结果以对应提交的 [GitHub Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml) 为准，不能沿用旧提交的成功状态。最新本地证据及产物身份见 [进度](docs/progress_v0.2.md)，发布边界见 [待执行清单](docs/release_checklist_v0.2.md)。下列 L3 真机证据尚未取得，不宣称三平台已全部验证：
+v0.2 的本次 Review 修复、关闭补修和功能优先首页已完成本地实现与回归，仍为 **L2 候选，不是已验收发布版**。CI 已接入完整浏览器门禁和四平台原生产物 smoke；交付分支为 `test`，实际远端结果以对应提交的 [GitHub Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml) 为准，不能沿用旧提交的成功状态。最新本地证据及产物身份见 [进度](docs/progress_v0.2.md)，发布边界见 [待执行清单](docs/release_checklist_v0.2.md)。下列 L3 真机证据尚未取得，不宣称三平台已全部验证：
 
 | 发布前真机组合 | 状态 |
 | --- | --- |

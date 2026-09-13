@@ -158,6 +158,23 @@ async function createDirectFixture(PeerImpl = FakePeerConnection, joined = true)
 }
 
 describe("PeerSession direct failure isolation", () => {
+  test("signaling shutdown retires an established RTC connection even when its owner is already completed", async () => {
+    const { session, socket, peer, timers, heartbeat } = await createDirectFixture();
+    peer.channel!.readyState = "open";
+    peer.channel!.onopen?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.directState).toBe("verified");
+    socket.close();
+    expect(peer.connectionState).toBe("closed");
+    expect(peer.channel!.readyState).toBe("closed");
+    expect(timers.size).toBe(0);
+    const sentCount = socket.sent.length;
+    heartbeat();
+    expect(socket.sent.length).toBe(sentCount);
+    expect(session.peer).toBeNull();
+    session.leave();
+  });
+
   test.each(["relay", "unknown", undefined])("unsafe %s path fails before RTC closes while relay signaling and heartbeat remain usable", async (candidateType) => {
     const { session, socket, peer, events, timers, advance, heartbeat } = await createDirectFixture();
     FakePeerConnection.candidateType = candidateType;

@@ -83,7 +83,13 @@ export class PeerSession {
         if (closeSocket) {
           try { socket.close(); } catch { /* Local connection cleanup is complete. */ }
         }
-        this.emit({ type: "signaling", state: "offline" });
+        try {
+          this.emit({ type: "signaling", state: "offline" });
+        } finally {
+          // A completed UI can ignore offline, but the retired service must not
+          // leave a browser-to-browser channel or RTC deadline running.
+          this.closeDirect();
+        }
       };
       socket.onopen = () => {
         if (!isCurrent() || opened) return;

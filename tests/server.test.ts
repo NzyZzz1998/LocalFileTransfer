@@ -132,6 +132,234 @@ function nextClose(socket: WebSocket): Promise<CloseEvent> {
   });
 }
 
+function requestShutdown(server: ReturnType<typeof startServer>) {
+  return fetch(new URL("/api/shutdown", server.url), {
+    method: "POST",
+    headers: { Origin: server.url.origin, "X-Dukou-Action": "shutdown" },
+  });
+}
+
+async function expectShutdownMessage(message: Promise<unknown>) {
+  const payload = await message as { type: string; requestId: string };
+  expect(payload).toEqual({ type: "service_shutdown", requestId: expect.any(String) });
+  expect(payload.requestId.length).toBeGreaterThan(0);
+  return payload.requestId;
+}
+
+function acknowledgeShutdown(socket: WebSocket, requestId: string, status = "ready") {
+  socket.send(JSON.stringify({ type: "shutdown_ack", requestId, status }));
+}
+
+describe("coordinated local shutdown", () => {
+  test.serial("the command-line watcher exits after successful local shutdown", async () => {
+    const child = Bun.spawn([process.execPath, "--watch", "src/server.ts"], {
+      cwd: resolve(import.meta.dir, ".."),
+      env: { ...process.env, HOST: "127.0.0.1", PORT: "0", RELAY_ENABLED: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      const firstChunk = await Promise.race([
+        reader.read(),
+        Bun.sleep(2_000).then(() => { throw new Error("watcher did not report a URL"); }),
+      ]);
+      const output = new TextDecoder().decode(firstChunk.value);
+      const urlText = output.match(/http:\/\/127\.0\.0\.1:\d+\//)?.[0];
+      expect(urlText).toBeDefined();
+      const url = new URL(urlText!);
+      const response = await fetch(new URL("/api/shutdown", url), {
+        method: "POST",
+        headers: { Origin: url.origin, "X-Dukou-Action": "shutdown" },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      const exitCode = await Promise.race([child.exited, Bun.sleep(1_500).then(() => null)]);
+      expect(exitCode).toBe(0);
+      await expect(fetch(new URL("/healthz", url))).rejects.toThrow();
+    } finally {
+      if (child.exitCode === null) {
+        if (process.platform === "win32") {
+          // Only the exact watcher process created by this test and its children.
+          Bun.spawnSync(["taskkill", "/PID", String(child.pid), "/T", "/F"], { stdout: "ignore", stderr: "ignore" });
+        } else {
+          child.kill();
+        }
+      }
+      await child.exited;
+    }
+  }, 10_000);
+
+  test("waits for every peer, rejects new transports, and accepts disconnect after ready", async () => {
+    const server = makeServer({ shutdownTimeoutMs: 500 });
+    const first = (await tryOpenWebSocket(server)).socket;
+    const second = (await tryOpenWebSocket(server)).socket;
+    const firstNotice = nextJsonMessage(first);
+    const secondNotice = nextJsonMessage(second);
+    let responded = false;
+    const response = requestShutdown(server).then((value) => { responded = true; return value; });
+    const requestId = await expectShutdownMessage(firstNotice);
+    expect(await expectShutdownMessage(secondNotice)).toBe(requestId);
+    acknowledgeShutdown(first, requestId);
+    const firstClosed = nextClose(first);
+    first.close();
+    await firstClosed;
+
+    for (const path of ["/ws", "/relay?token=unused"]) {
+      const denied = await fetch(new URL(path, server.url), { headers: { Origin: server.url.origin } });
+      expect(denied.status).toBe(503);
+    }
+    for (const path of ["/", "/healthz", "/api/runtime"]) {
+      expect((await fetch(new URL(path, server.url))).status).toBe(200);
+    }
+    expect(responded).toBe(false);
+
+    const secondClosed = nextClose(second);
+    acknowledgeShutdown(second, requestId);
+    const accepted = await response;
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ ok: true });
+    expect((await fetch(new URL("/ws", server.url), { headers: { Origin: server.url.origin } })).status).toBe(503);
+    await secondClosed;
+    await expect(fetch(new URL("/healthz", server.url))).rejects.toThrow();
+  });
+
+  test("concurrent local shutdown requests share one broadcast and result", async () => {
+    const server = makeServer({ shutdownTimeoutMs: 500 });
+    const peer = (await tryOpenWebSocket(server)).socket;
+    const broadcasts: unknown[] = [];
+    peer.addEventListener("message", (event) => broadcasts.push(JSON.parse(String(event.data))));
+    const notice = nextJsonMessage(peer);
+    const requests = [requestShutdown(server), requestShutdown(server)];
+    const requestId = await expectShutdownMessage(notice);
+    await fetch(new URL("/healthz", server.url));
+    acknowledgeShutdown(peer, requestId);
+    acknowledgeShutdown(peer, requestId);
+    const responses = await Promise.all(requests);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(await Promise.all(responses.map((response) => response.json()))).toEqual([{ ok: true }, { ok: true }]);
+    expect(broadcasts).toEqual([{ type: "service_shutdown", requestId }]);
+  });
+
+  test.each([
+    ["unsaved", "SHUTDOWN_UNSAVED_FILES"],
+    ["cleanup_failed", "SHUTDOWN_CLEANUP_FAILED"],
+  ])("%s blocks shutdown and permits a fresh successful retry", async (status, code) => {
+    const server = makeServer({ shutdownTimeoutMs: 500 });
+    const first = (await tryOpenWebSocket(server)).socket;
+    const second = (await tryOpenWebSocket(server)).socket;
+    const firstNotice = nextJsonMessage(first);
+    const secondNotice = nextJsonMessage(second);
+    const response = requestShutdown(server);
+    const requestId = await expectShutdownMessage(firstNotice);
+    await expectShutdownMessage(secondNotice);
+    acknowledgeShutdown(first, requestId);
+    acknowledgeShutdown(second, requestId, status);
+    const blocked = await response;
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toEqual({ ok: false, code });
+    expect((await fetch(new URL("/healthz", server.url))).status).toBe(200);
+    expect((await fetch(new URL("/ws", server.url), { headers: { Origin: server.url.origin } })).status).toBe(426);
+
+    const retryFirst = nextJsonMessage(first);
+    const retrySecond = nextJsonMessage(second);
+    const retry = requestShutdown(server);
+    const retryId = await expectShutdownMessage(retryFirst);
+    expect(retryId).not.toBe(requestId);
+    expect(await expectShutdownMessage(retrySecond)).toBe(retryId);
+    acknowledgeShutdown(first, retryId);
+    acknowledgeShutdown(second, retryId);
+    expect(await (await retry).json()).toEqual({ ok: true });
+  });
+
+  test("stale and malformed acknowledgements cannot satisfy the bounded cleanup wait", async () => {
+    const server = makeServer({ shutdownTimeoutMs: 100 });
+    const peer = (await tryOpenWebSocket(server)).socket;
+    const notice = nextJsonMessage(peer);
+    const response = requestShutdown(server);
+    const requestId = await expectShutdownMessage(notice);
+    acknowledgeShutdown(peer, "stale-request-id");
+    acknowledgeShutdown(peer, requestId, "complete");
+    peer.send(JSON.stringify({ type: "shutdown_ack", requestId, status: "ready", unexpected: true }));
+    const blocked = await response;
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toEqual({ ok: false, code: "SHUTDOWN_CLIENT_UNRESPONSIVE" });
+    expect((await fetch(new URL("/healthz", server.url))).status).toBe(200);
+
+    const retryNotice = nextJsonMessage(peer);
+    const retry = requestShutdown(server);
+    const retryId = await expectShutdownMessage(retryNotice);
+    acknowledgeShutdown(peer, requestId);
+    acknowledgeShutdown(peer, retryId);
+    expect(await (await retry).json()).toEqual({ ok: true });
+  });
+
+  test("a peer closing before acknowledgement blocks shutdown", async () => {
+    const server = makeServer({ shutdownTimeoutMs: 500 });
+    const peer = (await tryOpenWebSocket(server)).socket;
+    const notice = nextJsonMessage(peer);
+    const response = requestShutdown(server);
+    await expectShutdownMessage(notice);
+    peer.close();
+    const blocked = await response;
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toEqual({ ok: false, code: "SHUTDOWN_CLIENT_UNRESPONSIVE" });
+    expect((await fetch(new URL("/healthz", server.url))).status).toBe(200);
+  });
+
+  test.each(["oversized", "binary"])("%s shutdown acknowledgements retain signaling payload protections", async (kind) => {
+    const server = makeServer({
+      shutdownTimeoutMs: 500,
+      signalingConfig: { roomTtlMs: 600_000, maxMessageBytes: 128, joinRateLimit: { maxAttempts: 5, windowMs: 60_000 } },
+    });
+    const peer = (await tryOpenWebSocket(server)).socket;
+    const notice = nextJsonMessage(peer);
+    const response = requestShutdown(server);
+    const requestId = await expectShutdownMessage(notice);
+    const closed = nextClose(peer);
+    const payload = JSON.stringify({ type: "shutdown_ack", requestId: kind === "oversized" ? "x".repeat(200) : requestId, status: "ready" });
+    peer.send(kind === "binary" ? new TextEncoder().encode(payload) : payload);
+    expect((await closed).code).toBe(kind === "binary" ? 1003 : 1009);
+    expect(await (await response).json()).toEqual({ ok: false, code: "SHUTDOWN_CLIENT_UNRESPONSIVE" });
+  });
+
+  test("unauthorized HTTP and client signaling commands cannot initiate shutdown", async () => {
+    const server = makeServer();
+    const peer = (await tryOpenWebSocket(server)).socket;
+    for (const init of [
+      { method: "GET", headers: { Origin: server.url.origin, "X-Dukou-Action": "shutdown" } },
+      { method: "POST", headers: { Origin: "https://evil.example", "X-Dukou-Action": "shutdown" } },
+      { method: "POST", headers: { Origin: server.url.origin } },
+      { method: "POST", headers: { "X-Dukou-Action": "shutdown" } },
+    ]) {
+      expect((await fetch(new URL("/api/shutdown", server.url), init)).status).toBe(403);
+    }
+    const reply = nextJsonMessage(peer);
+    peer.send(JSON.stringify({ type: "service_shutdown", requestId: "remote-attempt" }));
+    expect(await reply).toMatchObject({ type: "error", code: "INVALID_MESSAGE" });
+    expect((await fetch(new URL("/healthz", server.url))).status).toBe(200);
+  });
+
+  test("successful cleanup acknowledgement closes active signaling and relay sockets", async () => {
+    const server = makeServer({ shutdownTimeoutMs: 500 });
+    const signals = await pairedSignals(server);
+    const tokens = await authorizeRelay(signals);
+    const senderRelay = await openRelay(server, tokens[0]!.token);
+    const receiverRelay = await openRelay(server, tokens[1]!.token);
+    await Promise.all([senderRelay.relayOpened, receiverRelay.relayOpened]);
+    const notices = [nextJsonMessage(signals.sender), nextJsonMessage(signals.receiver)];
+    const response = requestShutdown(server);
+    const requestId = await expectShutdownMessage(notices[0]!);
+    expect(await expectShutdownMessage(notices[1]!)).toBe(requestId);
+    const closed = [signals.sender, signals.receiver, senderRelay.socket, receiverRelay.socket].map(nextClose);
+    acknowledgeShutdown(signals.sender, requestId);
+    acknowledgeShutdown(signals.receiver, requestId);
+    expect(await (await response).json()).toEqual({ ok: true });
+    await Promise.all(closed);
+    await expect(fetch(new URL("/healthz", server.url))).rejects.toThrow();
+  });
+});
+
 describe("Bun HTTP/WebSocket server", () => {
   test("accepts only explicit boolean relay flag values", () => {
     expect(parseRelayEnabled(undefined)).toBe(true);

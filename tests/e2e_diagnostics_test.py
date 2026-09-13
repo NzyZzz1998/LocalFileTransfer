@@ -489,7 +489,7 @@ def verify_completed_disconnect(browser, base_url):
         sender.wait_for_function("() => globalThis.__completedChannelClosed === true", timeout=5_000)
         data = parse_diagnostic(copied_text(sender, diagnostic_button(sender, "sender")), [name, code])
         assert data["stage"] == "completed" and data["errorCode"] is None, data
-        expect(sender.locator("#sender-title")).to_have_text("文件已送达")
+        expect(sender.locator("#sender-title")).to_have_text("接收方已接收全部文件")
         assert sender.locator("#sender-error").is_hidden()
         assert not errors, errors
         print("PASS completed peer departure: actual channel close cannot overwrite delivery with a failure", flush=True)

@@ -19,8 +19,8 @@ describe("real transfer UI contract", () => {
     }
   });
 
-  test("describes server retention as file-content retention", () => {
-    expect(html).toContain("<dt>文件内容留存</dt><dd>无</dd>");
+  test("limits the no-retention statement to the server, not browser storage", () => {
+    expect(html).toContain("<dt>服务端文件留存</dt><dd>无</dd>");
   });
 
   test("does not invent device identities that signaling cannot verify", () => {

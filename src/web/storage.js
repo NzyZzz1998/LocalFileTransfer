@@ -8,6 +8,58 @@ export class StorageError extends Error {
   }
 }
 
+// Each module instance owns only the exact files it creates. Never enumerate
+// OPFS here: another tab can be receiving into the same origin's directory.
+const temporaryStorageByNavigator = new WeakMap();
+
+function registerTemporaryStorage(navigatorRef, root, tempName) {
+  let entries = temporaryStorageByNavigator.get(navigatorRef);
+  if (!entries) {
+    entries = new Set();
+    temporaryStorageByNavigator.set(navigatorRef, entries);
+  }
+  const entry = { root, tempName, entries, writable: null, sink: null };
+  entries.add(entry);
+  return entry;
+}
+
+async function removeTemporaryEntry(entry) {
+  try {
+    await entry.root.removeEntry(entry.tempName);
+  } catch (error) {
+    if (error.name !== "NotFoundError") throw error;
+  }
+  entry.entries.delete(entry);
+  entry.writable = null;
+}
+
+// The caller must first settle its storage operations and release files the
+// user still intends to save. Failed entries stay registered for a later retry.
+export async function cleanupTemporaryStorage(navigatorRef = globalThis.navigator) {
+  const entries = temporaryStorageByNavigator.get(navigatorRef);
+  if (!entries) return;
+  await Promise.all([...entries].map(async (entry) => {
+    for (let attempt = 0; entries.has(entry) && attempt < 2; attempt += 1) {
+      if (entry.writable) {
+        try {
+          await entry.writable.abort();
+          entry.writable = null;
+        } catch { /* An errored stream may already have released its file lock. */ }
+      }
+      try {
+        await removeTemporaryEntry(entry);
+        if (entry.sink) {
+          entry.sink.bytesWritten = 0;
+          entry.sink.state = "cleaned";
+        }
+      } catch { /* Retry each owned entry a bounded number of times. */ }
+    }
+  }));
+  if (entries.size > 0) {
+    throw new StorageError("STORAGE_CLEANUP_FAILED", "Temporary storage could not be fully removed");
+  }
+}
+
 function asBytes(chunk) {
   if (chunk instanceof Uint8Array) return chunk;
   if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
@@ -93,18 +145,14 @@ async function probeOpfs(navigatorRef, signal) {
   let root;
   let tempName;
   let writable;
+  let storageEntry;
   let created = false;
   let removalAttempts = 0;
   let available = false;
   async function removeProbe() {
     removalAttempts += 1;
-    try {
-      await root.removeEntry(tempName);
-      created = false;
-    } catch (error) {
-      if (error.name !== "NotFoundError") throw error;
-      created = false;
-    }
+    await removeTemporaryEntry(storageEntry);
+    created = false;
   }
   try {
     root = await navigatorRef.storage.getDirectory();
@@ -115,14 +163,17 @@ async function probeOpfs(navigatorRef, signal) {
     tempName = temporaryName("probe");
     // Also attempt cleanup if creation itself rejects after making the entry.
     created = true;
+    storageEntry = registerTemporaryStorage(navigatorRef, root, tempName);
     const fileHandle = await root.getFileHandle(tempName, { create: true });
     throwIfAborted(signal);
     writable = await fileHandle.createWritable({ keepExistingData: false });
+    storageEntry.writable = writable;
     throwIfAborted(signal);
     await writable.write(Uint8Array.of(0));
     throwIfAborted(signal);
     await writable.close();
     writable = null;
+    storageEntry.writable = null;
     throwIfAborted(signal);
     await removeProbe();
     available = true;
@@ -131,7 +182,10 @@ async function probeOpfs(navigatorRef, signal) {
     // can fail independently. Only a full successful probe selects OPFS.
   } finally {
     if (writable) {
-      try { await writable.abort(); } catch { /* Still attempt entry removal. */ }
+      try {
+        await writable.abort();
+        storageEntry.writable = null;
+      } catch { /* Still attempt entry removal. */ }
     }
     // One bounded retry handles a transient removal failure without hiding a
     // persistent orphan or retrying indefinitely after the user has cancelled.
@@ -139,10 +193,10 @@ async function probeOpfs(navigatorRef, signal) {
       try { await removeProbe(); } catch { /* Report a persistent failure below. */ }
     }
   }
-  throwIfAborted(signal);
   if (created) {
     throw new StorageError("STORAGE_CLEANUP_FAILED", "The storage probe could not be removed");
   }
+  throwIfAborted(signal);
   return available;
 }
 
@@ -218,13 +272,15 @@ export class MemorySink {
 }
 
 class OpfsSink {
-  constructor({ expectedSize, fileHandle, root, tempName, type, writable }) {
+  constructor({ expectedSize, fileHandle, root, tempName, type, writable, storageEntry }) {
     this.expectedSize = expectedSize;
     this.fileHandle = fileHandle;
     this.root = root;
     this.tempName = tempName;
     this.type = type;
     this.writable = writable;
+    this.storageEntry = storageEntry;
+    storageEntry.sink = this;
     this.kind = "opfs";
     this.bytesWritten = 0;
     this.state = "open";
@@ -265,6 +321,7 @@ class OpfsSink {
       );
     }
     await this.writable.close();
+    this.storageEntry.writable = null;
     const file = await this.fileHandle.getFile();
     this.state = "finalized";
     return this.type ? file.slice(0, file.size, this.type) : file;
@@ -277,7 +334,7 @@ class OpfsSink {
     } finally {
       // An already errored stream can reject abort while its temporary entry
       // still needs removal. Leave state retryable if removal itself fails.
-      await this.root.removeEntry(this.tempName);
+      await removeTemporaryEntry(this.storageEntry);
       this.bytesWritten = 0;
       this.state = "aborted";
     }
@@ -285,7 +342,7 @@ class OpfsSink {
 
   async cleanup() {
     if (this.state === "cleaned" || this.state === "aborted") return;
-    await this.root.removeEntry(this.tempName);
+    await removeTemporaryEntry(this.storageEntry);
     this.bytesWritten = 0;
     this.state = "cleaned";
   }
@@ -314,6 +371,7 @@ export async function createStorage({
   if (mode !== "memory" && typeof navigatorRef?.storage?.getDirectory === "function") {
     let root;
     let tempName;
+    let storageEntry;
     let fileCreated = false;
     try {
       root = await navigatorRef.storage.getDirectory();
@@ -322,8 +380,10 @@ export async function createStorage({
       }
       tempName = temporaryName();
       fileCreated = true;
+      storageEntry = registerTemporaryStorage(navigatorRef, root, tempName);
       const fileHandle = await root.getFileHandle(tempName, { create: true });
       const writable = await fileHandle.createWritable({ keepExistingData: false });
+      storageEntry.writable = writable;
       return new OpfsSink({
         expectedSize: size,
         fileHandle,
@@ -331,12 +391,13 @@ export async function createStorage({
         tempName,
         type: blobType,
         writable,
+        storageEntry,
       });
     } catch (cause) {
       if (fileCreated && typeof root?.removeEntry === "function") {
         for (let attempt = 0; fileCreated && attempt < 2; attempt += 1) {
           try {
-            await root.removeEntry(tempName);
+            await removeTemporaryEntry(storageEntry);
             fileCreated = false;
           } catch (error) {
             if (error.name === "NotFoundError") fileCreated = false;

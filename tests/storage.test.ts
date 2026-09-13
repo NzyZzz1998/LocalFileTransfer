@@ -1,6 +1,78 @@
 import { describe, expect, test } from "bun:test";
 
-import { MemorySink, assessStorageCapability, createStorage } from "../src/web/storage.js";
+import { MemorySink, assessStorageCapability, cleanupTemporaryStorage, createStorage } from "../src/web/storage.js";
+
+describe("temporary storage shutdown cleanup", () => {
+  test("releases only this navigator's registered temporary files, including open writers", async () => {
+    const opfs = createProbeOpfs();
+    const otherNavigator = { storage: opfs.storage };
+    opfs.state.entries.set(".dukou-transfer-foreign.part", { open: false });
+    opfs.state.entries.set("unrelated.txt", { open: false });
+    const ownSink = await createStorage({ size: 1, mode: "opfs", navigator: opfs });
+    await ownSink.write(Uint8Array.of(7));
+    const otherSink = await createStorage({ size: 1, mode: "opfs", navigator: otherNavigator });
+    const otherName = opfs.state.createdNames[1];
+
+    await cleanupTemporaryStorage(opfs);
+
+    expect([...opfs.state.entries.keys()].sort()).toEqual([
+      ".dukou-transfer-foreign.part", otherName, "unrelated.txt",
+    ].sort());
+    await expect(ownSink.write(Uint8Array.of(8))).rejects.toMatchObject({ code: "STORAGE_CLEANED" });
+    await otherSink.write(Uint8Array.of(9));
+    await otherSink.abort();
+  });
+
+  test("retries a probe that preflight could not remove", async () => {
+    const opfs = createProbeOpfs("remove", 2);
+    expect(await assessStorageCapability([{ size: 1 }], opfs))
+      .toMatchObject({ allowed: false, code: "STORAGE_CLEANUP_FAILED" });
+    expect(opfs.state.entries.size).toBe(1);
+
+    await cleanupTemporaryStorage(opfs);
+
+    expect(opfs.state.entries.size).toBe(0);
+  });
+
+  test("keeps partially created entries registered when opening and immediate cleanup both fail", async () => {
+    const opfs = createProbeOpfs("remove", 2, async (stage) => {
+      if (stage === "getFileHandle") throw new Error("creation failed after making its entry");
+    });
+    await expect(createStorage({ size: 1, mode: "opfs", navigator: opfs }))
+      .rejects.toMatchObject({ code: "STORAGE_CLEANUP_FAILED" });
+    expect(opfs.state.entries.size).toBe(1);
+
+    await cleanupTemporaryStorage(opfs);
+
+    expect(opfs.state.entries.size).toBe(0);
+  });
+
+  test("retries a transient removal failure after releasing the writer", async () => {
+    const opfs = createProbeOpfs("remove", 1);
+    await createStorage({ size: 1, mode: "opfs", navigator: opfs });
+
+    await cleanupTemporaryStorage(opfs);
+
+    expect(opfs.state.entries.size).toBe(0);
+    expect(opfs.state.removalAttempts).toBe(2);
+  });
+
+  test("reports persistent cleanup failures and retains them for a later retry", async () => {
+    let blocked = true;
+    const opfs = createProbeOpfs(undefined, 0, async (stage) => {
+      if (stage === "remove" && blocked) throw new Error("temporary lock");
+    });
+    await createStorage({ size: 1, mode: "opfs", navigator: opfs });
+
+    await expect(cleanupTemporaryStorage(opfs))
+      .rejects.toMatchObject({ code: "STORAGE_CLEANUP_FAILED" });
+    expect(opfs.state.entries.size).toBe(1);
+    expect(opfs.state.removalAttempts).toBe(2);
+    blocked = false;
+    await cleanupTemporaryStorage(opfs);
+    expect(opfs.state.entries.size).toBe(0);
+  });
+});
 
 describe("storage capability preflight", () => {
   test("blocks a memory-only batch whose aggregate size exceeds 256 MiB", async () => {
@@ -161,6 +233,28 @@ describe("storage capability preflight", () => {
       expect(opfs.state.entries.size).toBe(0);
     },
   );
+
+  test("reports an orphaned probe instead of masking failed cleanup as cancellation", async () => {
+    const controller = new AbortController();
+    let removalBlocked = true;
+    const opfs = createProbeOpfs(undefined, 0, async (stage) => {
+      if (stage === "write") controller.abort();
+      if (stage === "remove" && removalBlocked) throw new Error("temporary lock");
+    });
+
+    const result = await assessStorageCapability([{ size: 1 }], opfs, 10, {
+      signal: controller.signal,
+    }).catch((error) => error);
+
+    expect(result).toMatchObject({ allowed: false, code: "STORAGE_CLEANUP_FAILED" });
+    expect(opfs.state.entries.size).toBe(1);
+    expect(opfs.state.removalAttempts).toBe(2);
+    await expect(cleanupTemporaryStorage(opfs))
+      .rejects.toMatchObject({ code: "STORAGE_CLEANUP_FAILED" });
+    removalBlocked = false;
+    await cleanupTemporaryStorage(opfs);
+    expect(opfs.state.entries.size).toBe(0);
+  });
 
   test("concurrent probes do not overwrite or remove each other's files", async () => {
     const opfs = createProbeOpfs();

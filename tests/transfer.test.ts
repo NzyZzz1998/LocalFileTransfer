@@ -129,6 +129,92 @@ function flatten(chunks: Uint8Array[]): Uint8Array {
 
 
 describe("browser transfer protocol", () => {
+  test("receiver retains a storage cleanup failure separately from the transfer error for shutdown retry", async () => {
+    const { ReceiverEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const receiver = new ReceiverEngine(channel, { createSink: async () => ({ abort: async () => { throw new Error("file still locked"); } }) });
+    deliverProtocolControl(channel, { type: "offer_manifest", transferId: "shutdown", files: [{ id: "f", name: "f.bin", size: 1, mime: "application/octet-stream" }] });
+    await receiver.processing;
+    receiver.accept();
+    deliverProtocolControl(channel, { type: "file_start", transferId: "shutdown", fileId: "f", size: 1 });
+    await receiver.processing;
+    await receiver.fail(new Error("connection failed"));
+    await receiver.dispose();
+    expect(receiver.error.message).toBe("connection failed");
+    expect(receiver.cleanupError?.message).toBe("file still locked");
+  });
+
+  test("sender shutdown disposal waits for its outstanding file read and sends no later bytes", async () => {
+    const { SenderEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const read = deferred<ArrayBuffer>();
+    let reading = false;
+    const sender = new SenderEngine(channel);
+    const result = sender.send([{ name: "pending.bin", size: 1, type: "application/octet-stream", slice: () => ({ arrayBuffer: () => { reading = true; return read.promise; } }) }]);
+    deliverProtocolControl(channel, { type: "accept_manifest", transferId: sender.transferId });
+    await waitUntil(() => reading, "file read did not start");
+    let finished = false;
+    const disposal = sender.dispose().then(() => { finished = true; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    read.resolve(new Uint8Array([7]).buffer);
+    await disposal;
+    expect(await result).toMatchObject({ status: "cancelled" });
+    expect(binaryMessages(channel)).toEqual([]);
+    expect(sender.files).toEqual([]);
+  });
+
+  test("shutdown disposal waits for a pending sink creation and removes the late sink", async () => {
+    const { ReceiverEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const creation = deferred<any>();
+    let started = false;
+    let aborted = false;
+    const receiver = new ReceiverEngine(channel, { createSink: () => { started = true; return creation.promise; } });
+    deliverProtocolControl(channel, { type: "offer_manifest", transferId: "shutdown", files: [{ id: "f", name: "f.bin", size: 1, mime: "application/octet-stream" }] });
+    await receiver.processing;
+    receiver.accept();
+    deliverProtocolControl(channel, { type: "file_start", transferId: "shutdown", fileId: "f", size: 1 });
+    await waitUntil(() => started, "sink creation did not start");
+    let finished = false;
+    const disposal = receiver.dispose().then(() => { finished = true; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    creation.resolve({ abort: async () => { aborted = true; } });
+    await disposal;
+    expect(aborted).toBe(true);
+    expect(receiver.currentFile).toBeUndefined();
+    expect(receiver.receivedFiles).toEqual([]);
+    expect(receiver.state).toBe("cancelled");
+  });
+
+  test("shutdown disposal cannot resurrect a transfer whose finalization is in flight", async () => {
+    const { ReceiverEngine } = await import("../src/web/transfer.js");
+    const channel = new FakeChannel();
+    const finalization = deferred<Blob>();
+    let finalizing = false;
+    let aborted = false;
+    const states: string[] = [];
+    const receiver = new ReceiverEngine(channel, {
+      createSink: async () => ({ bytesWritten: 0, finalize: () => { finalizing = true; return finalization.promise; }, abort: async () => { aborted = true; } }),
+      onState: (state: string) => states.push(state),
+    });
+    deliverProtocolControl(channel, { type: "offer_manifest", transferId: "shutdown", files: [{ id: "f", name: "f.bin", size: 0, mime: "application/octet-stream" }] });
+    await receiver.processing;
+    receiver.accept();
+    deliverProtocolControl(channel, { type: "file_start", transferId: "shutdown", fileId: "f", size: 0 });
+    await receiver.processing;
+    deliverProtocolControl(channel, { type: "file_end", transferId: "shutdown", fileId: "f", sentBytes: 0 });
+    await waitUntil(() => finalizing, "finalization did not start");
+    const disposal = receiver.dispose();
+    finalization.resolve(new Blob([]));
+    await disposal;
+    expect(aborted).toBe(true);
+    expect(states).not.toContain("completed");
+    expect(receiver.receivedFiles).toEqual([]);
+    expect(controlMessages(channel).some((message) => message.type === "transfer_complete")).toBe(false);
+  });
+
   test("derives speed and ETA from acknowledged bytes with a two-second window", async () => {
     const { TransferMetrics } = await import("../src/web/transfer.js");
     let now = 0;

@@ -4,12 +4,36 @@
 
 ## 追踪信息
 
-- 当前状态：本次 Review 代码修复与本地自动化收口；已获提交/推送 test 授权，进入远端 CI 核验，L3 真机仍待补证
+- 当前状态：仓库已公开；“关闭无残留”补修与功能优先首页已本地验证并重建 Windows 产物，用户已授权提交并推送 test；远端 CI 与 L3 真机按对应候选补证
 - 目标版本：v0.2
 - 上游来源：`docs/prd_v0.2.md`、`docs/dev_plan_v0.2.md`
 - 下游承接：test 提交/推送（已授权）→ 新 CI 结果与真机补证 → acceptance → 授权后 release
 - 当前事实源：本文
-- 最后更新：2026-09-05
+- 最后更新：2026-09-14
+
+## test 推送与其他电脑启动（2026-09-14）
+
+- 用户明确授权推送关闭补修和首页调整；由 `test` 上包含本文的提交承载，不合并 main、不创建 PR、tag 或 Release。推送前 fetch 核对 HEAD 与 origin/test 同为 `db5e419`，无远端分歧；实际提交身份以 Git 为准。
+- README 补全首次 clone `test` → `bun install --frozen-lockfile` → `bun start`，以及已有克隆的安全更新步骤。只需一台电脑运行服务，其他电脑通过浏览器打开同一个 LAN 地址；不是每台电脑启动互不相通的独立服务。
+- 本地全套 `bun test` 在待交付代码上重新执行，239 pass / 0 fail / 887 assertions。另在不含 node_modules 的临时源码副本中执行 `bun install --frozen-lockfile` 和 `bun run start`：Bun 1.3.14 下安装成功，health/runtime/首页/JS/CSS 均返回 200，受保护关闭后进程自然退出 0、端口可重新绑定。这不是其他物理系统或跨设备验收；新 CI 结果及跨设备/TUN 证据仍需与实际提交对应。
+
+## 功能优先首页与公开仓库（2026-09-13）
+
+- 授权及远端：按用户要求将 `NzyZzz1998/LocalFileTransfer` 从 private 改为 public，并经匿名 GitHub API 验证。未改变默认分支 main，未合并、提交、推送或发布；本地仍在 `test@db5e419` 上保留关闭补修。
+- 前端：直接移除标语区及宣传徽章，不换成另一句广告。首页先展示发送/接收，再展示 LAN 地址、复制和本机关闭入口；保留必要的同网、存储、双方确认和未保存风险说明。发送/接收流程统一实用术语，移除航标、货单、靠岸、摆渡等包装和失效样式；演示保存明确标注不下载。
+- UI 反证：旧页面在 1280×720 下，发送入口顶端位于 y≈788，未进入首屏。新增真实浏览器检查在 1280×720、390×844 下确认发送、接收、复制地址完整处于首屏，且无横向溢出；修改后通过。
+- 验证：`bun test` 239 pass / 0 fail / 887 assertions；浏览器 UI 组（桌面/窄屏、演示流程、真实中转）、direct 组（中转开/关下的真实直连与下载字节）、diagnostics 组（15 场景）通过。Windows 新产物 smoke 核对 10 项资源字节一致、未授权关闭 403、授权关闭 200、自然退出 0；原生产物 `completed-saved` 场景核对下载字节、RTC/WS/计时器/临时文件清理、进程退出及端口释放通过。本轮未重跑完整 shutdown 10 场景，09-07 的完整回归保留为历史证据。
+- 最新 Windows 候选：`dist/dukou-windows-x64.exe`，版本 `0.2.0`，SHA256 `7837289854F94B5836EE72513FB5BCEDAE0EC599E3DC0B67E8BC4B23E7EE2969`，与 `dist/SHA256SUMS.txt` 一致。下方旧哈希不再代表当前产物。
+- 预览证据：`artifacts/ui-functional-20260913/`；本机 Chrome 实测，不等于手机支持或 macOS/Linux 真机验收。旧远端 CI 结果也不代表当前本地变更。
+
+## 关闭补修（2026-09-07）
+
+- 对象：`test@db5e419` 上的本地未提交工作树，版本仍为 `0.2.0`；本轮未推送、未创建 tag/Release。
+- 范围：全部连接清理确认后退出服务；开发 watcher 退出；未保存完整/部分批次保护；清理失败可重试；等待异步文件操作、下载交接及临时文件清理，不误报完成。
+- 单元及集成测试：`bun test` → **239 pass / 0 fail / 887 assertions**，13 个文件，包含实际 watch 退出、HTTP/WS 安全边界、引擎取消竞态、清理失败/重试。
+- 浏览器：`python tests/run_browser_tests.py --suite all` → 六组全部通过、退出 0（直连开/关、UI、lifecycle、recovery、diagnostics、shutdown）。关闭组 10 个场景覆盖正常/未保存/部分批次/故障/取消/重叠；之后补测“未保存阻止关闭时保留控制心跳”也通过。最终重建 Windows EXE 经 `python tests/e2e_shutdown_test.py --case all --binary dist/dukou-windows-x64.exe` 复验，10 个场景全部通过、退出 0；各场景核对服务自然退出 0、监听端口释放，未依赖强杀。
+- Windows 候选：`dist/dukou-windows-x64.exe`；SHA256 `FA212B5FD329EB1EFB1A9A1F65AEAD855378FA41AF2FE8393ADC6DD0B5AB9BCE`，已写入 `dist/SHA256SUMS.txt`。原生 smoke 已核对 10 个嵌入资源字节一致、未授权关闭 403、授权关闭 200、进程退出 0、无需强杀；下方 2026-09-05 哈希仅为历史证据。
+- 限制：本地使用 Windows/Chrome；`--browser chromium` 因本机没有配套 headless shell 未能运行。macOS/Linux 本轮运行与跨设备/TUN/吞吐不计为通过。异常崩溃、强杀、断电的历史 OPFS 文件不承诺自动清空，也不扫描或删除其他页面文件。
 
 ## 版本目标
 
@@ -142,8 +166,8 @@
 
 ## 下一步
 
-- 用户已同意先提交本次全部修复并推送到 `test` 运行 CI；本次不合并 main、不创建 tag/Release、不改变仓库可见性。
-- 本记录以上为提交前的本地证据；新远端 CI 按承载本次修复的提交核对 [Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml)，不会把授权或触发当作通过。
+- 上轮修复基线为 `test@db5e419`；本轮关闭补修、功能优先首页及启动说明已获提交/推送 test 授权。接下来核对本次新提交的 CI；不合并 main、不创建 tag/Release。
+- 远端 CI 按承载相应代码的提交核对 [Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml)，不能沿用旧提交的结果，也不把授权或触发当作通过。
 - 用户方便时再补 Windows↔macOS、TUN 和吞吐。发布面与最小待执行动作见 `docs/release_checklist_v0.2.md`。
 
 ## 记录边界
