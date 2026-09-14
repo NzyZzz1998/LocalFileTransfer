@@ -34,6 +34,11 @@
   const failedSinks = new Set();
   const shutdownPeers = new Set();
   const shutdownRequests = new Map();
+  const automaticShutdownRequests = new Map();
+  const latestShutdownIds = new WeakMap();
+  let automaticResumeJob = null;
+  let managerSocket = null;
+  let managerCanReconnect = true;
   let shuttingDown = false;
   const TERMINAL_TRANSFER_STATES = new Set(["completed", "rejected", "cancelled", "failed"]);
 
@@ -392,7 +397,11 @@
       const peer = new modules.PeerSession({
         onEvent: (event) => {
           if (event.type === "service_shutdown") {
-            void handleServiceShutdown(peer, event.requestId);
+            void handleServiceShutdown(peer, event.requestId, event.automatic === true);
+            return;
+          }
+          if (event.type === "service_shutdown_cancelled") {
+            cancelAutomaticShutdown(peer, event.requestId);
             return;
           }
           if (isCurrentScope(scope)) handleSessionEvent(event);
@@ -574,14 +583,71 @@
     clearPageTimers();
   }
 
-  async function handleServiceShutdown(peer, requestId) {
+  function cancelAutomaticShutdown(peer, requestId) {
+    const pending = shutdownRequests.get(peer);
+    const automaticRequest = automaticShutdownRequests.get(peer);
+    if (pending?.requestId === requestId) pending.cancelled = true;
+    if (automaticRequest?.requestId !== requestId && !pending?.cancelled) return;
+    automaticShutdownRequests.delete(peer);
+    managerCanReconnect = true;
+    if (!pending) {
+      // Cancellation of exit does not cancel ownership of an unfinished or
+      // failed cleanup. A later manual shutdown must still reach this page.
+      void (async () => {
+        await automaticResumeJob;
+        await settleWork(cleanupJobs);
+        await settleWork(downloadJobs);
+        if (latestShutdownIds.get(peer) !== requestId || shutdownRequests.has(peer) || automaticShutdownRequests.has(peer)) return;
+        if (automaticRequest?.cleanupFailed || failedSinks.size) {
+          shutdownStatus("自动退出已取消，但临时文件尚未清理完。请保留此页面，在本机重试关闭服务。");
+          return;
+        }
+        shutdownPeers.delete(peer);
+        if (peer !== session) peer.leave();
+      })();
+    }
+    shutdownStatus("本机管理页已重新打开，自动退出已取消。已接收的文件仍可保存。");
+  }
+
+  function resumeAutomaticShutdown() {
+    if (isDemo || unloadCleanupStarted || hasUnsavedFiles() || shuttingDown || !automaticShutdownRequests.size) return;
+    if (automaticResumeJob) return automaticResumeJob;
+    const requests = [...automaticShutdownRequests.values()];
+    // A save/discard is the only retry trigger. No background polling while a
+    // remote browser still holds an unsaved copy or storage cleanup has failed.
+    automaticResumeJob = (async () => {
+      await settleWork(downloadJobs);
+      if (hasUnsavedFiles() || !automaticShutdownRequests.size) return;
+      await releaseSession({ keepSignaling: true });
+      await cleanShutdownResources();
+      for (const [peer, request] of automaticShutdownRequests) {
+        if (request.sent) continue;
+        peer.send({ type: "shutdown_retry", requestId: request.requestId });
+        request.sent = true;
+      }
+      if (automaticShutdownRequests.size) shutdownStatus("文件已处理，正在等待服务完成自动退出…");
+    })().catch(() => {
+      for (const request of requests) request.cleanupFailed = true;
+      shutdownStatus("自动退出暂未完成。请保留此页面，在本机重新打开管理页并重试关闭服务。");
+    }).finally(() => { automaticResumeJob = null; });
+    return automaticResumeJob;
+  }
+
+  async function handleServiceShutdown(peer, requestId, automatic = false) {
     if (typeof requestId !== "string" || !requestId || requestId.length > 128) return;
+    latestShutdownIds.set(peer, requestId);
+    if (automatic) automaticShutdownRequests.set(peer, { requestId, sent: false });
+    else automaticShutdownRequests.delete(peer);
+    managerCanReconnect = false;
     const pending = shutdownRequests.get(peer);
     if (pending) {
+      // Reuse owned cleanup, not the cancellation state of the retired request.
       pending.requestId = requestId;
+      pending.automatic = automatic;
+      pending.cancelled = false;
       return;
     }
-    const request = { requestId };
+    const request = { requestId, automatic, cancelled: false };
     shutdownRequests.set(peer, request);
     shutdownPeers.add(peer);
     shuttingDown = true;
@@ -591,7 +657,9 @@
       if (hasUnsavedFiles()) {
         // Stop file transports, but keep control signaling until save/discard.
         await preserveReceivedFiles();
-        shutdownStatus("有接收完成的文件尚未保存，已暂停关闭服务。请先保存文件，或返回首页并确认放弃，然后在本机重试关闭。");
+        shutdownStatus(request.automatic
+          ? "本机管理页已关闭，但有文件尚未保存，服务暂时保留。请保存文件，或返回首页并确认放弃，之后服务会自动退出。"
+          : "有接收完成的文件尚未保存，已暂停关闭服务。请先保存文件，或返回首页并确认放弃，然后在本机重试关闭。");
         status = "unsaved";
       } else {
         shutdownStatus("正在结束连接并清理临时文件…");
@@ -603,22 +671,30 @@
     } catch {
       shutdownStatus("临时资源未能清理完，服务暂未关闭。请保留此页面并在本机重试关闭。");
     } finally {
-      try { peer.send({ type: "shutdown_ack", requestId: request.requestId, status }); } catch {
+      const automaticRequest = automaticShutdownRequests.get(peer);
+      if (automaticRequest) automaticRequest.cleanupFailed = status === "cleanup_failed";
+      try { if (!request.cancelled) peer.send({ type: "shutdown_ack", requestId: request.requestId, status }); } catch {
         shutdownStatus("关闭确认未送达，不能确认服务已退出；请在本机检查关闭结果。");
       }
       if (status === "ready") {
+        automaticShutdownRequests.delete(peer);
         shutdownPeers.delete(peer);
         peer.leave();
+      } else if (request.cancelled) {
+        automaticShutdownRequests.delete(peer);
+        if (status === "unsaved") shutdownPeers.delete(peer);
       }
       shutdownRequests.delete(peer);
       shuttingDown = false;
+      if (request.cancelled) shutdownStatus("本机管理页已重新打开，自动退出已取消。已接收的文件仍可保存。");
+      if (status === "unsaved") void resumeAutomaticShutdown();
     }
   }
 
   async function resetHome() {
     if (demoTimer) clearTimeout(demoTimer);
     if (progressTimer) clearInterval(progressTimer);
-    const cleanup = isDemo ? Promise.resolve() : releaseSession();
+    const cleanup = isDemo ? Promise.resolve() : releaseSession({ keepSignaling: automaticShutdownRequests.size > 0 });
     selectedFiles = [];
     byId("send-file-input").value = "";
     renderSenderFiles();
@@ -647,6 +723,7 @@
     showOnly(byId("home-screen"));
     announce("已返回首页");
     await cleanup;
+    void resumeAutomaticShutdown();
   }
 
   async function requestBackHome() {
@@ -826,6 +903,7 @@
             const timer = setTimeout(finish, 5_000);
             downloadTimers.set(timer, finish);
           }), downloadJobs);
+          void resumeAutomaticShutdown();
         } catch {
           save.textContent = "保存失败 · 重试";
           announce("浏览器未能开始下载，文件仍暂存在当前页面，可再次尝试");
@@ -1353,6 +1431,8 @@
   function bestEffortPageExitCleanup() {
     if (isDemo || unloadCleanupStarted) return;
     unloadCleanupStarted = true;
+    managerCanReconnect = false;
+    managerSocket?.close();
     // Page destruction cancels its timers. Start these removals now instead of
     // waiting forever for a download-grace callback on a destroyed document.
     for (const [timer, finish] of downloadTimers) {
@@ -1362,6 +1442,7 @@
     void releaseSession();
     for (const peer of shutdownPeers) peer.leave();
     shutdownPeers.clear();
+    automaticShutdownRequests.clear();
   }
 
   byId("choose-sender").addEventListener("click", enterSender);
@@ -1557,7 +1638,53 @@
   });
   byId("cancel-transfer-button").addEventListener("click", () => void cancelCurrentTransfer());
   addEventListener("pagehide", bestEffortPageExitCleanup);
-  addEventListener("beforeunload", bestEffortPageExitCleanup);
+  addEventListener("beforeunload", (event) => {
+    // Confirmation may be cancelled. Do not touch files, transports or the
+    // management connection until pagehide actually commits the navigation.
+    if (isDemo || !(hasUnsavedFiles() || hasActiveWork() || downloadJobs.size)) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+  addEventListener("pageshow", (event) => {
+    // A restored BFCache document must not reuse its retired transfer scope.
+    if (event.persisted && !isDemo) location.reload();
+  });
+
+  function connectLocalManager(allowReconnect = true) {
+    if (isDemo || unloadCleanupStarted || managerSocket) return;
+    const status = byId("local-manager-status");
+    status.hidden = false;
+    status.textContent = "正在启用关页自动退出…";
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${scheme}//${location.host}/local-manager`);
+    managerSocket = socket;
+    socket.addEventListener("message", (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type === "manager_ready") {
+        status.textContent = "本机管理页 · 关闭最后一个本机标签页约 5 秒后退出服务；有未保存文件时会暂缓退出。";
+      }
+    });
+    socket.addEventListener("close", async () => {
+      if (managerSocket !== socket) return;
+      managerSocket = null;
+      if (unloadCleanupStarted || !managerCanReconnect) return;
+      // One bounded reconnect covers a transient socket loss. A stopped service
+      // must not leave reconnect intervals or perpetual network traffic behind.
+      if (allowReconnect) {
+        try {
+          const response = await fetch("/healthz", { cache: "no-store", signal: AbortSignal.timeout(1_000) });
+          if (response.ok && managerCanReconnect && !unloadCleanupStarted) {
+            connectLocalManager(false);
+            return;
+          }
+        } catch { /* Show the disconnected state without claiming a clean exit. */ }
+      }
+      if (!unloadCleanupStarted && managerCanReconnect) {
+        status.textContent = "本机管理连接已断开，无法确认服务状态。若要继续使用，请检查运行窗口并刷新页面。";
+      }
+    });
+  }
 
   function renderRelayAvailability() {
     byId("use-relay-button").hidden = !relayEnabled;
@@ -1594,6 +1721,7 @@
       runtimeVersion = typeof runtime.version === "string" && /^\d+\.\d+\.\d+$/.test(runtime.version) ? runtime.version : "unknown";
       relayEnabled = runtime.relayEnabled === true;
       byId("shutdown-service-button").hidden = runtime.canShutdown !== true;
+      if (runtime.canShutdown === true && !isDemo) connectLocalManager();
       const urls = [...new Set(runtime.lanUrls)].filter((url) => !new URL(url).hostname.startsWith("127."));
       const recommended = urls.includes(runtime.recommendedUrl) ? runtime.recommendedUrl : urls[0];
       if (!recommended) {
@@ -1640,6 +1768,7 @@
     const warning = "关闭会结束所有电脑的房间与传输，并清理临时数据。尚未保存的接收文件会先保留并阻止关闭，请先保存或明确放弃。确定关闭渡口服务吗？";
     if (!window.confirm(warning)) return;
     button.disabled = true;
+    managerCanReconnect = false;
     button.textContent = "正在关闭…";
     shutdownStatus("正在等待各个页面清理连接和临时文件…");
     try {
@@ -1675,6 +1804,7 @@
       shutdownStatus("");
       byId("shutdown-notice").hidden = false;
     } catch (error) {
+      managerCanReconnect = true;
       button.disabled = false;
       button.textContent = "关闭渡口服务";
       shutdownStatus(error.name === "TimeoutError" || error.name === "TypeError"

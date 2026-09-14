@@ -66,11 +66,16 @@ def run_suite(suite: str, base_url: str):
         # Shutdown asserts process exit, so every case must own its own server.
         with arguments(shutdown, "--case", "all"):
             shutdown.main()
+    elif suite == "tab-exit":
+        import e2e_tab_exit_test as tab_exit
+        tab_exit.find_browser = direct.find_browser
+        with arguments(tab_exit, "--case", "all"):
+            tab_exit.main()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["all", "direct", "ui", "lifecycle", "recovery", "diagnostics", "shutdown"], default="all")
+    parser.add_argument("--suite", choices=["all", "direct", "ui", "lifecycle", "recovery", "diagnostics", "shutdown", "tab-exit"], default="all")
     parser.add_argument("--port", type=int, default=0, help="Exclusive local test port; 0 automatically selects an available port, never 3000")
     parser.add_argument("--browser", choices=["auto", "chromium"], default="auto", help="auto prefers installed Chrome; chromium uses Playwright's pinned browser")
     parser.add_argument("--artifacts-dir", type=Path, help="Optional CI screenshot directory; default is disposable")
@@ -94,7 +99,7 @@ def main():
         screenshots.mkdir(parents=True, exist_ok=True)
         direct.SCREENSHOTS = screenshots
         ui.SCREENSHOTS = screenshots
-        suites = ["direct", "ui", "lifecycle", "recovery", "diagnostics", "shutdown"] if args.suite == "all" else [args.suite]
+        suites = ["direct", "ui", "lifecycle", "recovery", "diagnostics", "shutdown", "tab-exit"] if args.suite == "all" else [args.suite]
         for suite in suites:
             run_suite(suite, f"http://127.0.0.1:{args.port}")
     print(f"PASS browser gate: {', '.join(suites)}", flush=True)

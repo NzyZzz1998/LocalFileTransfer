@@ -191,6 +191,7 @@ TEMPORARY_FILES = """async () => {
 RESOURCE_SNAPSHOT = """() => ({
   rtc: __shutdownProbe.peers.map(peer => peer.connectionState),
   sockets: __shutdownProbe.sockets.map(socket => socket.readyState),
+  signaling: __shutdownProbe.sockets.filter(socket => new URL(socket.url).pathname === '/ws').map(socket => socket.readyState),
   channels: __shutdownProbe.channels.map(channel => channel.readyState),
   timeouts: [...__shutdownProbe.timeouts.values()],
   intervals: [...__shutdownProbe.intervals.values()],
@@ -330,7 +331,8 @@ def connect_and_receive(sender, receiver, payload=PAYLOAD, complete=True, files=
         assert page.locator(f"#{prefix}-route-fact").inner_text() == "局域网直连"
         snapshot = page.evaluate(RESOURCE_SNAPSHOT)
         assert snapshot["rtc"] == ["connected"], snapshot
-        assert snapshot["sockets"] == [1], snapshot
+        # Local pages additionally own a page-lifetime management connection.
+        assert snapshot["signaling"] == [1], snapshot
 
 
 def save_and_check(receiver, payload=PAYLOAD, name=FILENAME):
@@ -469,7 +471,7 @@ def verify_cancelled_confirmation(browser, binary=None):
             snapshot = page.evaluate(RESOURCE_SNAPSHOT)
             assert snapshot["rtc"] == ["connected"], snapshot
             assert snapshot["channels"] == ["open"], snapshot
-            assert snapshot["sockets"] == [1], snapshot
+            assert snapshot["signaling"] == [1], snapshot
         assert receiver.evaluate(TEMPORARY_FILES) == original_files
         assert control.locator("#shutdown-notice").is_hidden()
         assert control.locator("#shutdown-service-button").is_enabled()
@@ -600,7 +602,7 @@ def verify_cleanup_failure(browser, binary=None, return_home=False):
         assert receiver.evaluate("() => __removalFault.failures") > 0
         assert len(receiver.evaluate(TEMPORARY_FILES)) == 1, "Test must still contain the file whose removal failed"
         snapshot = receiver.evaluate(RESOURCE_SNAPSHOT)
-        assert snapshot["sockets"] == [1], f"Cleanup failure lost the signaling owner required for retry: {snapshot}"
+        assert snapshot["signaling"] == [1], f"Cleanup failure lost the signaling owner required for retry: {snapshot}"
         for page in (receiver, control):
             page.locator("#shutdown-status").wait_for(state="visible")
             assert "清理" in page.locator("#shutdown-status").inner_text()
@@ -625,7 +627,7 @@ def verify_home_shutdown_overlap(browser, binary=None):
         receiver.locator("#receiver-screen [data-action='back-home']").first.click()
         receiver.locator("#home-screen").wait_for(state="visible")
         assert len(receiver.evaluate(TEMPORARY_FILES)) == 1, "Download handoff must still be pending at shutdown"
-        assert receiver.evaluate(RESOURCE_SNAPSHOT)["sockets"] == [1]
+        assert receiver.evaluate(RESOURCE_SNAPSHOT)["signaling"] == [1]
         response = request_shutdown(control)
         assert response.status == 200, f"Overlapping home cleanup lost the shutdown acknowledgement: {response.status} {response.text()}"
         assert_browser_clean(sender, "overlap sender")

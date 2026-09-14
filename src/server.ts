@@ -31,6 +31,7 @@ export interface ServerOptions {
   relayEnabled?: boolean;
   relayConfig?: Partial<Omit<RelayHubOptions, "now"> & RelayQueueOptions>;
   shutdownTimeoutMs?: number;
+  autoShutdownDelayMs?: number;
   onShutdownComplete?: () => void;
 }
 
@@ -45,12 +46,17 @@ interface RelaySocketData {
   connectionId: string;
 }
 
-type SocketData = SignalingSocketData | RelaySocketData;
+interface ManagerSocketData {
+  kind: "local-manager";
+  managerId: string;
+}
+
+type SocketData = SignalingSocketData | RelaySocketData | ManagerSocketData;
 
 type ShutdownStatus = "pending" | "ready" | "unsaved" | "cleanup_failed" | "unresponsive";
 type ShutdownResult = { ok: true } | {
   ok: false;
-  code: "SHUTDOWN_UNSAVED_FILES" | "SHUTDOWN_CLEANUP_FAILED" | "SHUTDOWN_CLIENT_UNRESPONSIVE";
+  code: "SHUTDOWN_UNSAVED_FILES" | "SHUTDOWN_CLEANUP_FAILED" | "SHUTDOWN_CLIENT_UNRESPONSIVE" | "SHUTDOWN_CANCELLED";
 };
 
 interface ShutdownAttempt {
@@ -60,6 +66,12 @@ interface ShutdownAttempt {
   resolve: (result: ShutdownResult) => void;
   timer?: ReturnType<typeof setTimeout>;
   completed: boolean;
+  automatic: boolean;
+}
+
+interface AutoShutdownIntent {
+  attempt?: ShutdownAttempt;
+  retryRequested: boolean;
 }
 
 const signalingConfig: SignalingConfig = {
@@ -121,6 +133,7 @@ export function startServer(options: ServerOptions = {}) {
   });
   const sockets = new Map<string, Bun.ServerWebSocket<SocketData>>();
   const relaySockets = new Map<string, Bun.ServerWebSocket<SocketData>>();
+  const managerSockets = new Map<string, Bun.ServerWebSocket<SocketData>>();
   const relayConfig = { ...RELAY_DEFAULTS, ...RELAY_QUEUE_DEFAULTS, ...options.relayConfig };
   const relayHub = new RelayHub({
     ...relayConfig,
@@ -135,6 +148,8 @@ export function startServer(options: ServerOptions = {}) {
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
   let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
   let shutdownAttempt: ShutdownAttempt | undefined;
+  let autoShutdownTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoShutdownIntent: AutoShutdownIntent | undefined;
   let stopped = false;
 
   const stop = async (closeActiveConnections?: boolean) => {
@@ -142,8 +157,61 @@ export function startServer(options: ServerOptions = {}) {
     stopped = true;
     if (sweepTimer) clearInterval(sweepTimer);
     if (shutdownTimer) clearTimeout(shutdownTimer);
+    if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+    autoShutdownIntent = undefined;
     if (shutdownAttempt && !shutdownAttempt.completed) finishShutdown(shutdownAttempt, true);
     await bunServer.stop(closeActiveConnections);
+  };
+
+  const scheduleStop = (attempt: ShutdownAttempt) => {
+    if (stopped || shutdownTimer) return;
+    // Let joined HTTP responses arrive; a returning manager can still cancel an automatic exit.
+    shutdownTimer = setTimeout(async () => {
+      shutdownTimer = undefined;
+      if (stopped || shutdownAttempt !== attempt ||
+        (attempt.automatic && (!autoShutdownIntent || managerSockets.size > 0))) return;
+      await stop(true);
+      options.onShutdownComplete?.();
+    }, 75);
+    shutdownTimer.unref();
+  };
+
+  const runAutomaticShutdown = (intent: AutoShutdownIntent) => {
+    if (stopped || autoShutdownIntent !== intent || managerSockets.size > 0 || shutdownAttempt) return;
+    intent.retryRequested = false;
+    void requestShutdown(intent);
+  };
+
+  const cancelAutomaticShutdown = () => {
+    if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+    autoShutdownTimer = undefined;
+    const intent = autoShutdownIntent;
+    autoShutdownIntent = undefined;
+    const attempt = intent?.attempt;
+    if (!attempt || !attempt.automatic) return;
+    if (shutdownAttempt === attempt) {
+      if (shutdownTimer) clearTimeout(shutdownTimer);
+      shutdownTimer = undefined;
+      if (attempt.timer) clearTimeout(attempt.timer);
+      attempt.completed = true;
+      shutdownAttempt = undefined;
+      attempt.resolve({ ok: false, code: "SHUTDOWN_CANCELLED" });
+    }
+    const notice = JSON.stringify({ type: "service_shutdown_cancelled", requestId: attempt.requestId });
+    for (const peerId of attempt.peers.keys()) {
+      try { sockets.get(peerId)?.send(notice); } catch { /* A departed tab has nothing to resume. */ }
+    }
+  };
+
+  const armAutomaticShutdown = () => {
+    if (stopped || managerSockets.size > 0 || shutdownAttempt || autoShutdownIntent) return;
+    const intent: AutoShutdownIntent = { retryRequested: false };
+    autoShutdownIntent = intent;
+    autoShutdownTimer = setTimeout(() => {
+      autoShutdownTimer = undefined;
+      runAutomaticShutdown(intent);
+    }, options.autoShutdownDelayMs ?? 5_000);
+    autoShutdownTimer.unref();
   };
 
   const finishShutdown = (attempt: ShutdownAttempt, timedOut = false) => {
@@ -162,9 +230,22 @@ export function startServer(options: ServerOptions = {}) {
     // Failed attempts release the admission gate so clients can save files and retry.
     if (code) shutdownAttempt = undefined;
     attempt.resolve(code ? { ok: false, code } : { ok: true });
+    if (!code) scheduleStop(attempt);
+    const intent = autoShutdownIntent;
+    if (code && intent?.attempt === attempt && intent.retryRequested) {
+      // A save/discard can finish before the final peer acknowledges the original attempt.
+      queueMicrotask(() => runAutomaticShutdown(intent));
+    }
   };
 
-  const requestShutdown = (): Promise<ShutdownResult> => {
+  const requestShutdown = (automaticIntent?: AutoShutdownIntent): Promise<ShutdownResult> => {
+    if (!automaticIntent) {
+      // Explicit local confirmation takes precedence over the cancellable last-tab intent.
+      if (autoShutdownTimer) clearTimeout(autoShutdownTimer);
+      autoShutdownTimer = undefined;
+      autoShutdownIntent = undefined;
+      if (shutdownAttempt) shutdownAttempt.automatic = false;
+    }
     if (shutdownAttempt) return shutdownAttempt.promise;
     const { promise, resolve } = Promise.withResolvers<ShutdownResult>();
     const attempt: ShutdownAttempt = {
@@ -173,11 +254,16 @@ export function startServer(options: ServerOptions = {}) {
       promise,
       resolve,
       completed: false,
+      automatic: Boolean(automaticIntent),
     };
+    if (automaticIntent) automaticIntent.attempt = attempt;
     shutdownAttempt = attempt;
     attempt.timer = setTimeout(() => finishShutdown(attempt, true), options.shutdownTimeoutMs ?? 10_000);
     attempt.timer.unref();
-    const notice = JSON.stringify({ type: "service_shutdown", requestId: attempt.requestId });
+    const notice = JSON.stringify({
+      type: "service_shutdown", requestId: attempt.requestId,
+      ...(attempt.automatic ? { automatic: true } : {}),
+    });
     for (const [peerId, socket] of sockets) {
       try {
         if (socket.send(notice) === 0) attempt.peers.set(peerId, "unresponsive");
@@ -189,7 +275,7 @@ export function startServer(options: ServerOptions = {}) {
     return promise;
   };
 
-  const receiveShutdownAck = (peerId: string, payload: string | Uint8Array): boolean => {
+  const receiveShutdownControl = (peerId: string, payload: string | Uint8Array): boolean => {
     // Control frames have a narrow shape and cannot bypass signaling size/binary limits.
     if (typeof payload !== "string" || payload.length > 256 ||
       new TextEncoder().encode(payload).byteLength > Math.min(256, config.maxMessageBytes)) return false;
@@ -199,7 +285,21 @@ export function startServer(options: ServerOptions = {}) {
     } catch {
       return false;
     }
-    if (typeof message !== "object" || message === null || !("type" in message) || message.type !== "shutdown_ack") return false;
+    if (typeof message !== "object" || message === null || !("type" in message)) return false;
+    if (message.type === "shutdown_retry") {
+      const retry = message as Record<string, unknown>;
+      const intent = autoShutdownIntent;
+      const attempt = intent?.attempt;
+      const status = attempt?.peers.get(peerId);
+      if (Object.keys(retry).length === 2 && typeof retry.requestId === "string" &&
+        intent && attempt && retry.requestId === attempt.requestId &&
+        (status === "unsaved" || status === "cleanup_failed") && managerSockets.size === 0) {
+        intent.retryRequested = true;
+        if (attempt.completed) runAutomaticShutdown(intent);
+      }
+      return true;
+    }
+    if (message.type !== "shutdown_ack") return false;
     const ack = message as Record<string, unknown>;
     const attempt = shutdownAttempt;
     if (Object.keys(ack).length === 3 && typeof ack.requestId === "string" &&
@@ -280,14 +380,6 @@ export function startServer(options: ServerOptions = {}) {
           request.headers.get("x-dukou-action") === "shutdown";
         if (!authorized) return secureResponse("Shutdown is only available locally", { status: 403 });
         const result = await requestShutdown();
-        if (result.ok && !shutdownTimer) {
-          // Let all joined HTTP responses reach their callers before stopping the listener.
-          shutdownTimer = setTimeout(async () => {
-            await stop(true);
-            options.onShutdownComplete?.();
-          }, 75);
-          shutdownTimer.unref();
-        }
         return secureResponse(JSON.stringify(result), {
           status: result.ok ? 200 : 409,
           headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -298,6 +390,17 @@ export function startServer(options: ServerOptions = {}) {
           status: 405,
           headers: { Allow: "GET" },
         });
+      }
+      if (pathname === "/local-manager") {
+        if (!isLoopbackAddress(server.requestIP(request)?.address) || request.headers.get("origin") !== requestUrl.origin) {
+          return secureResponse("Management is only available locally", { status: 403 });
+        }
+        if (stopped || (shutdownAttempt && !shutdownAttempt.automatic)) {
+          return secureResponse("Service shutdown in progress", { status: 503 });
+        }
+        const managerId = crypto.randomUUID();
+        if (server.upgrade(request, { data: { kind: "local-manager", managerId } })) return;
+        return secureResponse("WebSocket upgrade required", { status: 426 });
       }
       if ((pathname === "/ws" || pathname === "/relay") && (shutdownAttempt || stopped)) {
         return secureResponse("Service shutdown in progress", { status: 503, headers: { "Retry-After": "1" } });
@@ -361,6 +464,16 @@ export function startServer(options: ServerOptions = {}) {
     },
     websocket: {
       open(socket) {
+        if (socket.data.kind === "local-manager") {
+          if (stopped || (shutdownAttempt && !shutdownAttempt.automatic)) {
+            socket.close(1001, "Service shutdown in progress");
+            return;
+          }
+          managerSockets.set(socket.data.managerId, socket);
+          cancelAutomaticShutdown();
+          socket.send(JSON.stringify({ type: "manager_ready" }));
+          return;
+        }
         if (shutdownAttempt || stopped) {
           socket.close(1001, "Service shutdown in progress");
           return;
@@ -382,6 +495,8 @@ export function startServer(options: ServerOptions = {}) {
         }
       },
       message(socket, message) {
+        // Management sockets carry presence only, never remote commands or signaling.
+        if (socket.data.kind === "local-manager") return;
         if (socket.data.kind === "relay") {
           if (typeof message === "string") {
             finishRelay(relayHub.disconnect(socket.data.connectionId, "RELAY_PROTOCOL"));
@@ -410,7 +525,7 @@ export function startServer(options: ServerOptions = {}) {
             : message instanceof Uint8Array
               ? message
               : new Uint8Array(message);
-        if (receiveShutdownAck(socket.data.peerId, payload)) return;
+        if (receiveShutdownControl(socket.data.peerId, payload)) return;
         dispatch(core.receive(socket.data.peerId, payload));
       },
       drain(socket) {
@@ -421,6 +536,10 @@ export function startServer(options: ServerOptions = {}) {
         }
       },
       close(socket, code) {
+        if (socket.data.kind === "local-manager") {
+          if (managerSockets.delete(socket.data.managerId) && managerSockets.size === 0) armAutomaticShutdown();
+          return;
+        }
         if (socket.data.kind === "relay") {
           relaySockets.delete(socket.data.connectionId);
           relayBackpressure.remove(socket.data.connectionId);

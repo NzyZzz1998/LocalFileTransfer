@@ -4,12 +4,31 @@
 
 ## 追踪信息
 
-- 当前状态：仓库已公开；“关闭无残留”补修与功能优先首页已本地验证并重建 Windows 产物，用户已授权提交并推送 test；远端 CI 与 L3 真机按对应候选补证
+- 当前状态：仓库已公开；关页自动退出已本地实现、回归并重建 Windows 产物，用户已授权本次提交并推送 test；Windows↔Mac 真机待验收
 - 目标版本：v0.2
 - 上游来源：`docs/prd_v0.2.md`、`docs/dev_plan_v0.2.md`
-- 下游承接：test 提交/推送（已授权）→ 新 CI 结果与真机补证 → acceptance → 授权后 release
+- 下游承接：本次授权提交/推送 test → 对应 CI 与 Windows↔Mac 真机补证 → acceptance → 授权后 release
 - 当前事实源：本文
 - 最后更新：2026-09-14
+
+## 关页功能授权推送与双机验收（2026-09-14）
+
+- 用户明确要求先推送，并计划今天通过 Mac 浏览器连接 Windows 验收。提交目标沿用 `test`，由该分支包含本记录的提交承载；不合并 main、不创建 PR/tag/Release。
+- 推送前 fetch 核对 HEAD 与 origin/test 同为 `b82e9401e90b1456141519bebcf26d324ef4a489`，左右提交数为 0/0。重新执行 `bun test`：260 pass / 0 fail / 1000 assertions；Windows 产物 smoke 通过，嵌入资源一致、受保护关闭正常、退出 0；另重跑原生 `home-close`，约 5 秒宽限后进程正常退出并释放端口。
+- 本次 Windows 产物 SHA256 仍为 `C5C3E66628BBEC7CA613DCC3A7165BBBBC2EE5CB4DCA32BDA8FF84E24C09E0CD`。`dist/` 不随 Git 提交上传，源码推送不等于发布 exe；远端构建按新提交对应 CI 结果判断，不能引用历史结果为本轮背书。
+- 验收入口：Windows 打开 localhost 管理页，Mac 打开 Windows 的 LAN 地址；先以小文件测试两个方向并确认下载内容，再验证未保存保护、关闭最后一个本机页后的退出，以及只关闭 Mac 页面不退出。实际双机/TUN/吞吐结果尚未取得。
+
+## 关页自动退出（2026-09-14，本地未提交）
+
+- 开发时对象：`test@b82e9401e90b1456141519bebcf26d324ef4a489` 上的未提交工作树，版本仍为 `0.2.0`。开发时仅获实现授权，随后获得本次提交/推送授权（见上节）；仍未授权正式发布。
+- 行为：通过 localhost/127.0.0.1 打开的本机管理页登记轻量连接。最后一个管理页断开约 5 秒后发起现有安全关闭；缓冲期内刷新/重开或仍有另一管理页时不退出。远端收发页不能发起退出，从未打开管理页的服务也不自动退出。没有新增运行时依赖、桌面壳、常驻辅助进程或自启动项。
+- 文件与失败：未保存文件保留；保存交给浏览器并完成下载交接/清理，或返回首页明确放弃后，继续原先由本机发起的自动退出。重新打开管理页取消自动退出。清理失败、页面未回应或异常断开不视为可以丢弃文件，不强退；可在本机重开管理页重试。
+- 反证与修复：先观察空闲关页后 PID 不退出，以及未保存文件离开时没有浏览器警告；另以真实下载和 OPFS 故障复现清理失败后重开丢失清理通道、取消旧退出后新手动关闭丢失 ACK。四类反证均已修复并回归；独立只读复核确认两处竞态修复闭合。
+- 单元/集成：最后一次 `bun test` 为 **260 pass / 0 fail / 1000 assertions**，14 个文件。新增 21 个真实服务端用例覆盖本机权限、真实非 loopback/伪造头拒绝、刷新/多页、未保存重试与过期消息、取消、手动优先和计时器清理。
+- 源码浏览器：本轮分别运行 direct、UI、lifecycle、recovery、diagnostics 组，手动 shutdown 全部 10 场景，以及集成入口 `--suite tab-exit` 全部 **13 场景**，均退出 0。新增关页组包含宽限期、多页、远端角色、保存/放弃/取消、重开和两处清理竞态；真实下载字节、RTC/WS/计时器/OPFS、正常进程退出与端口释放均有断言。
+- 原生产物：重新编译 Windows x64，smoke 核对 10 个嵌入资源、未授权关闭 403、授权关闭 200、退出 0、无需强杀。随后 `python tests/e2e_tab_exit_test.py --binary dist/dukou-windows-x64.exe --case all` 的 **13 场景全部通过，退出 0**，每场景观察自有进程正常退出与端口释放。
+- 最新 Windows 候选：`dist/dukou-windows-x64.exe`，SHA256 `C5C3E66628BBEC7CA613DCC3A7165BBBBC2EE5CB4DCA32BDA8FF84E24C09E0CD`；已同步 `dist/SHA256SUMS.txt`。下方历史哈希不再代表当前文件。
+- 边界：Windows + 已安装 Chrome 的本机自动化；浏览器远端角色仅替换 runtime 的 canShutdown 标志，服务端另有真实非 loopback 权限测试，不冒充 Windows↔Mac 真机验收。Mac/Linux 原生、跨设备/TUN/吞吐仍未验证；本次未触发远端 CI。浏览器异常终止/休眠与慢重载不能完美区别于关页，历史 OPFS 清理不在保证内。
 
 ## test 推送与其他电脑启动（2026-09-14）
 
@@ -166,6 +185,7 @@
 
 ## 下一步
 
+- 本次关页自动退出已经本地完成并获得提交/推送授权；下一步核对对应 CI，等待用户 Windows↔Mac 双机验收。以下上一批推送记录保留为历史。
 - 上轮修复基线为 `test@db5e419`；本轮关闭补修、功能优先首页及启动说明已获提交/推送 test 授权。接下来核对本次新提交的 CI；不合并 main、不创建 tag/Release。
 - 远端 CI 按承载相应代码的提交核对 [Actions](https://github.com/NzyZzz1998/LocalFileTransfer/actions/workflows/build.yml)，不能沿用旧提交的结果，也不把授权或触发当作通过。
 - 用户方便时再补 Windows↔macOS、TUN 和吞吐。发布面与最小待执行动作见 `docs/release_checklist_v0.2.md`。
