@@ -74,7 +74,7 @@ def verify_sender(browser) -> None:
     page.get_by_text("583 204", exact=True).wait_for()
     page.get_by_role("heading", name="一台浏览器请求接收").wait_for(timeout=5_000)
     page.get_by_role("button", name="允许连接").click()
-    page.get_by_role("heading", name="直连没有建立").wait_for(timeout=5_000)
+    page.locator("#sender-route-failed").wait_for(timeout=5_000)
     page.get_by_text("DIRECT_TIMEOUT · 20.0s", exact=True).wait_for()
     page.get_by_role("button", name="改用本地中转").click()
     page.get_by_role("heading", name="等待接收方同意中转").wait_for()

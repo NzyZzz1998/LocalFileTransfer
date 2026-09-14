@@ -14,6 +14,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from e2e_relay_lifecycle_test import file_payload, isolated_server, open_home, return_home
 from e2e_recovery_preflight_test import TRACK_BOUNDARIES, browser_fault_script, download_result
+from e2e_shutdown_test import HOLD_SECOND_FILE_CHUNK
 from e2e_transfer_test import find_browser
 
 
@@ -172,7 +173,8 @@ def diagnostic_button(page, prefix):
 def parse_diagnostic(text, forbidden):
     data = json.loads(text)
     allowed = {"version", "os", "browser", "stage", "elapsedMs", "totalElapsedMs", "failedStage",
-               "signalingState", "iceState", "connectionState", "localCandidateType", "remoteCandidateType", "errorCode"}
+               "signalingState", "iceState", "connectionState", "localCandidateType", "remoteCandidateType", "errorCode",
+               "role", "route", "transferredBytes", "totalBytes", "transferStarted"}
     assert set(data) == allowed, f"Diagnostic must include the agreed state contract and no arbitrary context: {set(data)}"
     for secret in [*forbidden, "203.0.113.77", "192.168.50.10", "127.0.0.1", "private-sdp", "secret.invalid", "Mozilla/"]:
         assert secret not in text, f"Diagnostic disclosed {secret!r}"
@@ -182,6 +184,11 @@ def parse_diagnostic(text, forbidden):
     assert isinstance(data["browser"], str) and 0 < len(data["browser"]) < 32
     assert isinstance(data["elapsedMs"], (int, float)) and data["elapsedMs"] >= 0
     assert isinstance(data["totalElapsedMs"], (int, float)) and data["totalElapsedMs"] >= data["elapsedMs"]
+    assert data["role"] in {"sender", "receiver"}
+    assert data["route"] in {"direct", "local_relay", "undetermined"}
+    assert isinstance(data["transferStarted"], bool)
+    assert type(data["transferredBytes"]) is int and data["transferredBytes"] >= 0
+    assert type(data["totalBytes"]) is int and data["totalBytes"] >= data["transferredBytes"]
     return data
 
 
@@ -223,6 +230,9 @@ def verify_timeline_success(browser, base_url):
             assert data["signalingState"] == "open"
             assert data["connectionState"] == "connected"
             assert data["localCandidateType"] == "host" and data["remoteCandidateType"] == "host"
+            assert data["role"] == prefix and data["route"] == "direct"
+            assert data["transferredBytes"] == 0 and data["totalBytes"] == len(payload)
+            assert data["transferStarted"] is False
         download_result(sender, receiver, name, payload)
         expect(sender.locator("#sender-progress-bytes").locator("..")).to_contain_text("对方已接收")
         assert not errors, errors
@@ -353,6 +363,7 @@ def verify_active_failure_snapshot(browser, base_url):
             assert data["stage"] == "failed", f"A terminated transfer must not keep a {data['stage']} diagnostic"
             assert data["failedStage"] == "transferring"
             assert data["errorCode"].startswith("DIRECT_") or data["errorCode"] in {"PEER_LEFT", "TRANSFER_FAILED"}, data
+            assert data["role"] == prefix and data["route"] == "direct" and data["transferStarted"] is True
             expect_stage(page, prefix, "ready", "failed")
         for page in [sender, receiver]:
             page.wait_for_function("() => globalThis.__signalSockets.at(-1).readyState === WebSocket.CLOSED", timeout=5_000)
@@ -384,11 +395,140 @@ def verify_early_signal_failure(browser, base_url):
         assert data["stage"] == "failed"
         assert data["errorCode"] == "SIGNAL_OFFLINE"
         assert data["signalingState"] == "closed"
+        assert data["role"] == "sender" and data["route"] == "undetermined"
+        assert data["transferredBytes"] == 0 and data["totalBytes"] == 0 and data["transferStarted"] is False
         assert page.locator("#sender-prepare").is_visible()
         assert not errors, errors
         print("PASS early signaling failure: visible error and copyable offline diagnostic before any room exists", flush=True)
     finally:
         context.close()
+
+
+def verify_retained_ready_signal_failure(browser, base_url, disconnected_role):
+    # A native signaling failure while waiting for file acceptance must not be
+    # overwritten by the transfer engine's subsequent datachannel-close error.
+    errors = []
+    sender_context, sender = configure_context(browser, errors, "sender")
+    receiver_context, receiver = configure_context(browser, errors, "receiver")
+    for context in [sender_context, receiver_context]:
+        context.add_init_script(TRACK_BOUNDARIES)
+    try:
+        open_home(sender, base_url)
+        open_home(receiver, base_url)
+        name, payload = "private-unaccepted-diagnostic.bin", b"not accepted, not transferred"
+        code = join_without_approval(sender, receiver, name, payload)
+        sender.locator("#approve-peer-button").click()
+        receiver.locator("#receiver-file-list").get_by_text(name, exact=True).wait_for(timeout=10_000)
+        expect(receiver.locator("#accept-files-button")).to_be_enabled()
+        page = sender if disconnected_role == "sender" else receiver
+        forbidden = [name, code, "private-ready-disconnect"]
+        before = parse_diagnostic(copied_text(page, diagnostic_button(page, disconnected_role)), forbidden)
+        assert before["stage"] == "ready" and before["errorCode"] is None, before
+        assert before["role"] == disconnected_role and before["route"] == "direct"
+        assert before["transferredBytes"] == 0 and before["totalBytes"] == len(payload)
+        assert before["transferStarted"] is False
+        page.evaluate("globalThis.__signalSockets.at(-1).close(4000, 'private-ready-disconnect')")
+        expect(page.locator(f"#{disconnected_role}-error")).to_be_visible(timeout=10_000)
+        first = parse_diagnostic(copied_text(page, diagnostic_button(page, disconnected_role)), forbidden)
+        print(f"INFO retained ready {disconnected_role} signal failure: {json.dumps(first, sort_keys=True)}", flush=True)
+        assert first["errorCode"] == "SIGNAL_OFFLINE", first
+        assert first["stage"] == "failed" and first["failedStage"] == "ready", first
+        assert first["role"] == disconnected_role and first["route"] == "direct"
+        assert first["transferredBytes"] == 0 and first["totalBytes"] == len(payload)
+        assert first["transferStarted"] is False
+        for endpoint in [sender, receiver]:
+            endpoint.wait_for_function("() => globalThis.__rtcPeers.every(peer => peer.connectionState === 'closed') && globalThis.__signalSockets.every(socket => socket.readyState === WebSocket.CLOSED)", timeout=5_000)
+        after = parse_diagnostic(copied_text(page, diagnostic_button(page, disconnected_role)), forbidden)
+        assert after == first, f"Close cleanup changed the unaccepted failure snapshot: {first} -> {after}"
+        expect_stage(page, disconnected_role, "ready", "failed")
+        assert not errors, errors
+        print(f"PASS ready {disconnected_role} signal failure: offline cause survives close cleanup before acceptance; no transferred bytes", flush=True)
+    finally:
+        sender_context.close()
+        receiver_context.close()
+
+
+def verify_retained_active_failure(browser, base_url, disconnected_role="sender", relay=False):
+    # Losing the original error, resetting byte counters during disposal, or
+    # labeling a relay failure as direct must fail this real transport test.
+    errors = []
+    sender_context, sender = configure_context(browser, errors, "sender", unsafe=relay)
+    receiver_context, receiver = configure_context(browser, errors, "receiver", unsafe=relay)
+    name = "private-retained-diagnostic.bin"
+    payload = bytes((index * 13 + 7) % 256 for index in range(524_291))
+    for context in [sender_context, receiver_context]:
+        context.add_init_script(TRACK_BOUNDARIES)
+        context.add_init_script("""(() => {
+          globalThis.__diagnosticWrittenBytes = 0;
+          globalThis.__diagnosticAckBytes = 0;
+          const write = FileSystemWritableFileStream.prototype.write;
+          FileSystemWritableFileStream.prototype.write = async function(value) {
+            const result = await write.call(this, value);
+            if (value.byteLength >= 16384) globalThis.__diagnosticWrittenBytes += value.byteLength;
+            return result;
+          };
+          const createDataChannel = RTCPeerConnection.prototype.createDataChannel;
+          RTCPeerConnection.prototype.createDataChannel = function(...args) {
+            const channel = createDataChannel.apply(this, args);
+            channel.addEventListener('message', event => {
+              if (typeof event.data === 'string') {
+                const message = JSON.parse(event.data);
+                if (typeof message.overallBytes === 'number') globalThis.__diagnosticAckBytes = message.overallBytes;
+              }
+            });
+            return channel;
+          };
+        })();""")
+    sender_context.add_init_script(HOLD_SECOND_FILE_CHUNK
+        .replace("shutdown-byte-proof.bin", name)
+        .replace("Number(args[0]) > 0", "Number(args[0]) >= 262144"))
+    try:
+        open_home(sender, base_url)
+        open_home(receiver, base_url)
+        code = join_without_approval(sender, receiver, name, payload)
+        sender.locator("#approve-peer-button").click()
+        if relay:
+            sender.locator("#sender-route-failed").wait_for(state="visible", timeout=5_000)
+            sender.locator("#use-relay-button").click()
+            receiver.locator("#approve-relay-button").click()
+        receiver.locator("#receiver-file-list").get_by_text(name, exact=True).wait_for(timeout=10_000)
+        receiver.locator("#accept-files-button").click()
+        sender.wait_for_function("() => globalThis.__fileReadGate.blocked", timeout=10_000)
+        receiver.wait_for_function("() => globalThis.__diagnosticWrittenBytes === 262144", timeout=10_000)
+        # Observe a real receipt rather than the throttled UI progress paint.
+        if not relay:
+            sender.wait_for_function("() => globalThis.__diagnosticAckBytes === 262144", timeout=10_000)
+        page = sender if disconnected_role == "sender" else receiver
+        forbidden = [name, code, "private-diagnostic-disconnect"]
+        if relay:
+            forbidden += page.evaluate("globalThis.__relaySockets.map(({socket}) => new URL(socket.url).searchParams.get('token'))")
+            page.evaluate("globalThis.__relaySockets.at(-1).socket.close(4000, 'private-diagnostic-disconnect')")
+        else:
+            page.evaluate("globalThis.__signalSockets.at(-1).close(4000, 'private-diagnostic-disconnect')")
+        expect(page.locator(f"#{disconnected_role}-error")).to_be_visible(timeout=10_000)
+        first_text = copied_text(page, diagnostic_button(page, disconnected_role))
+        first = json.loads(first_text)
+        print(f"INFO retained {disconnected_role} {'relay' if relay else 'signal'} failure: {json.dumps(first, sort_keys=True)}", flush=True)
+        assert first["errorCode"] == ("RELAY_CLOSED" if relay else "SIGNAL_OFFLINE"), first
+        assert first["stage"] == "failed" and first["failedStage"] == "transferring", first
+        first = parse_diagnostic(first_text, forbidden)
+        assert first["role"] == disconnected_role
+        assert first["route"] == ("local_relay" if relay else "direct")
+        assert first["transferStarted"] is True
+        assert first["transferredBytes"] == 262_144 and first["totalBytes"] == len(payload), first
+        sender.evaluate("globalThis.__fileReadGate.release()")
+        for endpoint in [sender, receiver]:
+            endpoint.wait_for_function("() => globalThis.__rtcPeers.every(peer => peer.connectionState === 'closed') && globalThis.__relaySockets.every(({socket}) => socket.readyState === WebSocket.CLOSED)", timeout=5_000)
+        # Copying after native read completion/close cleanup must retain the
+        # same failed stage, original cause, route, counters and frozen timing.
+        second = parse_diagnostic(copied_text(page, diagnostic_button(page, disconnected_role)), forbidden)
+        assert second == first, f"Cleanup changed the original failure snapshot: {first} -> {second}"
+        expect_stage(page, disconnected_role, "ready", "failed")
+        assert not errors, errors
+        print(f"PASS retained {disconnected_role} {'relay' if relay else 'signal'} failure: first cause, route and actual byte progress survive cleanup without private data", flush=True)
+    finally:
+        sender_context.close()
+        receiver_context.close()
 
 
 def verify_relay_diagnostic_phases(browser, base_url):
@@ -422,11 +562,16 @@ def verify_relay_diagnostic_phases(browser, base_url):
         for page, prefix in [(sender, "sender"), (receiver, "receiver")]:
             data = parse_diagnostic(copied_text(page, diagnostic_button(page, prefix)), [name, code])
             assert data["stage"] == "relay_ready" and data["errorCode"] is None
+            assert data["role"] == prefix and data["route"] == "local_relay"
+            assert data["transferredBytes"] == 0 and data["totalBytes"] == len(payload)
+            assert data["transferStarted"] is False
             expect(page.locator(f"#{prefix}-route-timeline [data-step='verify']")).to_contain_text("中转")
         download_result(sender, receiver, name, payload)
         for page, prefix in [(sender, "sender"), (receiver, "receiver")]:
             data = parse_diagnostic(copied_text(page, diagnostic_button(page, prefix)), [name, code])
             assert data["stage"] == "completed" and data["errorCode"] is None
+            assert data["route"] == "local_relay" and data["transferStarted"] is True
+            assert data["transferredBytes"] == len(payload) and data["totalBytes"] == len(payload)
         assert not errors, errors
         print("PASS relay diagnostics: pending, declined, pending again, ready and completed supersede direct failure", flush=True)
     finally:
@@ -453,6 +598,7 @@ def verify_terminal_route_actions(browser, base_url):
         expect(sender.locator("#sender-error")).to_be_visible(timeout=5_000)
         relay = sender.locator("#use-relay-button")
         assert relay.is_disabled() or relay.is_hidden(), "A departed peer cannot approve relay; do not offer a dead action"
+        expect(sender.locator("#retry-direct-button")).to_be_visible(timeout=3_000)
         expect(sender.locator("#retry-direct-button")).to_be_enabled()
         sender.locator("#retry-direct-button").click()
         sender.wait_for_function("previous => document.querySelector('#room-code').textContent.replace(/\\D/g, '') !== previous", arg=code)
@@ -489,6 +635,8 @@ def verify_completed_disconnect(browser, base_url):
         sender.wait_for_function("() => globalThis.__completedChannelClosed === true", timeout=5_000)
         data = parse_diagnostic(copied_text(sender, diagnostic_button(sender, "sender")), [name, code])
         assert data["stage"] == "completed" and data["errorCode"] is None, data
+        assert data["route"] == "direct" and data["transferStarted"] is True
+        assert data["transferredBytes"] == len(payload) and data["totalBytes"] == len(payload)
         expect(sender.locator("#sender-title")).to_have_text("接收方已接收全部文件")
         assert sender.locator("#sender-error").is_hidden()
         assert not errors, errors
@@ -523,7 +671,7 @@ def verify_join_error_refresh(browser, base_url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:4138")
-    parser.add_argument("--case", choices=["all", "lan-list", "lan-empty", "runtime-failed", "copy-fallback", "timeline", "diagnostic-unsafe", "diagnostic-timeout", "diagnostic-fallback", "retry-snapshot", "active-failure", "signal-failure", "relay-phases", "terminal-outlet", "completed-disconnect", "join-errors"], default="all")
+    parser.add_argument("--case", choices=["all", "lan-list", "lan-empty", "runtime-failed", "copy-fallback", "timeline", "diagnostic-unsafe", "diagnostic-timeout", "diagnostic-fallback", "retry-snapshot", "active-failure", "signal-failure", "ready-signal-sender", "ready-signal-receiver", "active-signal-sender", "active-signal-receiver", "active-relay-failure", "relay-phases", "terminal-outlet", "completed-disconnect", "join-errors"], default="all")
     parser.add_argument("--start-server", action="store_true")
     args = parser.parse_args()
     cases = [
@@ -538,6 +686,11 @@ def main():
         ("retry-snapshot", verify_retry_file_snapshot, ()),
         ("active-failure", verify_active_failure_snapshot, ()),
         ("signal-failure", verify_early_signal_failure, ()),
+        ("ready-signal-sender", verify_retained_ready_signal_failure, ("sender",)),
+        ("ready-signal-receiver", verify_retained_ready_signal_failure, ("receiver",)),
+        ("active-signal-sender", verify_retained_active_failure, ("sender", False)),
+        ("active-signal-receiver", verify_retained_active_failure, ("receiver", False)),
+        ("active-relay-failure", verify_retained_active_failure, ("receiver", True)),
         ("relay-phases", verify_relay_diagnostic_phases, ()),
         ("terminal-outlet", verify_terminal_route_actions, ()),
         ("completed-disconnect", verify_completed_disconnect, ()),

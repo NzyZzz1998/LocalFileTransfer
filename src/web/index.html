@@ -135,13 +135,14 @@
 
             <div id="sender-route-failed" class="route-decision" hidden>
               <div class="decision-code">DIRECT_TIMEOUT · 20.0s</div>
-              <h3>直连没有建立</h3>
-              <p>请检查 TUN / VPN、访客 Wi-Fi 或防火墙设置。尚未发送文件，也未自动切换到中转。</p>
+              <h3>尚未开始传输</h3>
+              <p>可以重试直连，或由双方确认使用本地中转。渡口不会自动更换传输路线。</p>
               <p id="relay-disabled-notice" hidden>本地中转已关闭或不可用，可重试直连或联系运行渡口的人。</p>
-              <div class="button-row">
-                <button id="use-relay-button" class="primary-button" type="button" hidden disabled>改用本地中转</button>
-                <button id="retry-direct-button" class="secondary-button" type="button">重试直连</button>
-              </div>
+            </div>
+
+            <div id="sender-route-actions" class="button-row" hidden>
+              <button id="use-relay-button" class="secondary-button" type="button" hidden disabled>改用本地中转</button>
+              <button id="retry-direct-button" class="secondary-button" type="button" hidden>重试直连</button>
             </div>
 
             <div id="sender-relay-pending" class="relay-consent" role="status" hidden>
@@ -178,7 +179,7 @@
             <div><dt>服务端文件留存</dt><dd>无</dd></div>
             <div><dt>本地中转</dt><dd id="sender-relay-fact">仅双方确认后</dd></div>
           </dl>
-          <p class="board-warning">无法直连时，只有双方确认，才会通过运行渡口的电脑中转。中转文件不会保存在服务端磁盘。</p>
+          <p class="board-warning">传输前可申请本地中转，双方确认后才会通过运行渡口的电脑转发。中转文件不会保存在服务端磁盘。</p>
         </aside>
       </section>
 
@@ -225,8 +226,8 @@
 
           <div id="receiver-relay-consent" class="receiver-stage" hidden>
             <div class="relay-consent relay-consent-receiver">
-              <h3>发送方希望改用本地中转</h3>
-              <p>直连没有成功。文件密文会经过运行渡口服务的电脑内存，不会落盘；这条路径的安全边界弱于浏览器直连。</p>
+              <h3>发送方申请本地中转</h3>
+              <p>文件密文会经过运行渡口服务的电脑内存，不会落盘；这条路径的安全边界弱于浏览器直连。</p>
               <dl class="consent-facts">
                 <div><dt>已发送文件内容</dt><dd>0 B</dd></div>
                 <div><dt>服务端留存</dt><dd>无</dd></div>

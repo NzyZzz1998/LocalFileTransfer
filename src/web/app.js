@@ -87,13 +87,19 @@
   ]);
 
   function diagnosticFor(scope) {
+    if (scope.frozenDiagnostic) return scope.frozenDiagnostic;
     const peer = scope.peer?.getDiagnosticSnapshot();
     if (!peer) return lastDiagnostics.get(scope.role);
+    const context = {
+      role: scope.role, route: scope.route ?? "undetermined",
+      transferredBytes: scope.transferredBytes ?? 0, totalBytes: scope.totalBytes ?? 0,
+      transferStarted: scope.transferStarted,
+    };
     const overlay = scope.diagnosticPhase;
-    if (!overlay) return peer;
+    if (!overlay) return { ...peer, ...context };
     const elapsed = overlay.terminal ? overlay.elapsedMs : Math.max(0, Math.round(performance.now() - overlay.at));
     return {
-      ...peer, stage: overlay.stage, elapsedMs: elapsed,
+      ...peer, ...context, stage: overlay.stage, elapsedMs: elapsed,
       totalElapsedMs: overlay.totalElapsedMs + (overlay.terminal ? 0 : elapsed),
       failedStage: overlay.failedStage, errorCode: overlay.errorCode,
     };
@@ -113,7 +119,7 @@
       if (position === index && !failed && !ready) item.setAttribute("aria-current", "step");
       else item.removeAttribute("aria-current");
     }
-    const relay = snapshot.stage.startsWith("relay_") || sessionScope?.role === role && sessionScope?.relayActive;
+    const relay = snapshot.route === "local_relay";
     timeline.querySelector('[data-step="route"]').textContent = relay ? "双方确认本地中转" : "建立局域网连接";
     timeline.querySelector('[data-step="verify"]').textContent = relay ? "验证中转加密通道" : "验证通道";
     byId(`${role}-diagnostic-tools`).hidden = false;
@@ -122,16 +128,25 @@
 
   function recordUiPhase(scope, stage, code = null) {
     if (!isCurrentScope(scope)) return;
-    const previous = diagnosticFor(scope);
     const terminal = ["failed", "completed", "cancelled"].includes(stage);
+    // Teardown can emit more errors or cancellation. Keep the first terminal
+    // evidence; an explicit new route attempt is allowed to start a fresh phase.
+    if (terminal && scope.frozenDiagnostic) return;
+    const previous = diagnosticFor(scope);
+    scope.frozenDiagnostic = null;
     scope.diagnosticPhase = {
       stage, at: performance.now(), terminal,
       elapsedMs: terminal ? previous?.elapsedMs ?? 0 : 0,
       totalElapsedMs: previous?.totalElapsedMs ?? 0,
-      failedStage: stage === "failed" ? previous?.stage ?? "idle" : null,
-      errorCode: code ? (UI_ERROR_CODES.has(code) ? code : "UNKNOWN") : null,
+      failedStage: stage === "failed" ? previous?.failedStage ?? previous?.stage ?? "idle" : null,
+      // Before acceptance, PeerSession owns the phase and may already have
+      // frozen the causal error. Its snapshot is whitelist-sanitized too.
+      errorCode: stage === "failed" && ["failed", "direct_failed"].includes(previous?.stage) && previous.errorCode
+        ? previous.errorCode : code ? (UI_ERROR_CODES.has(code) ? code : "UNKNOWN") : null,
     };
+    if (terminal) scope.frozenDiagnostic = Object.freeze(diagnosticFor(scope));
     renderTimeline(scope.role, diagnosticFor(scope));
+    if (scope.role === "sender") renderRouteActions();
   }
 
   function browserFamily() {
@@ -331,6 +346,8 @@
     if (event.code === "RELAY_LIMIT") return "本地中转已达到资源上限，请稍后重新连接";
     if (event.code === "RELAY_TIMEOUT") return "本地中转等待超时，请重新连接";
     if (event.code === "RELAY_AUTH_FAILED") return "中转数据校验失败，传输已停止，请重新连接";
+    if (event.code === "SIGNAL_OFFLINE") return "配对服务连接已断开，请重新开始";
+    if (event.code === "RELAY_CLOSED") return "本地中转连接已断开，请重新开始";
     if (event.code === "INVALID_SERVER_MESSAGE") return "配对服务返回了无法识别的信息";
     return "这次传输的状态已经变化，请返回后重试";
   }
@@ -431,6 +448,7 @@
     scope.roomRequested = true;
     // A room owns its selection; later file-picker changes never alter its payload.
     scope.files = Object.freeze([...files]);
+    scope.totalBytes = files.reduce((sum, file) => sum + file.size, 0);
     const peer = await connection;
     requireCurrentScope(scope);
     try {
@@ -522,6 +540,7 @@
     receiverEngine = null;
     directChannel = null;
     roomActive = false;
+    renderRouteActions();
     objectUrls.clear();
     metricsByPrefix.clear();
     lastProgressPaint.clear();
@@ -703,6 +722,7 @@
     byId("sender-progress").hidden = true;
     byId("sender-connected").hidden = true;
     byId("sender-route-failed").hidden = true;
+    byId("sender-route-actions").hidden = true;
     byId("sender-route-timeline").hidden = true;
     byId("receiver-route-timeline").hidden = true;
     byId("sender-diagnostic-tools").hidden = true;
@@ -767,12 +787,14 @@
     byId("sender-route-timeline").hidden = false;
     byId("sender-route-fact").textContent = "正在寻找直连";
     byId("sender-encryption-fact").textContent = "尚未建立";
+    renderRouteActions();
     announce("正在寻找局域网直连");
     demoTimer = setTimeout(() => {
       byId("sender-connected").hidden = true;
       byId("sender-route-timeline").hidden = true;
       byId("sender-route-failed").hidden = false;
       byId("sender-route-fact").textContent = "直连超时 · 未切换传输方式";
+      renderRouteActions();
       announce("直连没有建立，可以重试或申请本地中转");
     }, 650);
   }
@@ -804,6 +826,7 @@
     const list = byId("receiver-file-list");
     list.replaceChildren(...files.map((file) => createFileRow(file)));
     const total = files.reduce((sum, file) => sum + file.size, 0);
+    if (!isDemo) scope.totalBytes = total;
     byId("receiver-summary").textContent = `${files.length} 个文件 · ${formatBytes(total)}`;
     byId("receiver-title").textContent = "核对这批文件";
     showReceiverStage(byId("receiver-offer"));
@@ -916,6 +939,12 @@
   }
 
   function updateProgress(prefix, progress) {
+    if (sessionScope?.role === prefix && !sessionScope.frozenDiagnostic) {
+      // Sender progress is acknowledged bytes; receiver progress is stored bytes.
+      // Capture every update, independent of the throttled visual progress paint.
+      sessionScope.transferredBytes = progress.overallBytes;
+      sessionScope.totalBytes = progress.totalBytes;
+    }
     let metrics = metricsByPrefix.get(prefix);
     if (!metrics || progress.overallBytes === 0) {
       metrics = new realModules.TransferMetrics();
@@ -993,7 +1022,8 @@
         if (state === "failed") {
           roomActive = false;
           recordUiPhase(scope, "failed", scope.relayFailure?.code ?? "TRANSFER_FAILED");
-          showError("receiver", scope.relayFailure ? errorMessage(scope.relayFailure) : "传输数据异常，本次传输已停止");
+          const failure = diagnosticFor(scope);
+          showError("receiver", failure.errorCode === "TRANSFER_FAILED" ? "传输数据异常，本次传输已停止" : errorMessage({ code: failure.errorCode }));
           closeRelays(scope);
           if (hasUnsavedFiles()) void preserveReceivedFiles();
         }
@@ -1013,6 +1043,7 @@
         if (state === "awaiting_acceptance") {
           byId("sender-connected").hidden = false;
           byId("sender-connected").querySelector("strong").textContent = "等待对方确认文件";
+          byId("sender-connected").querySelector("small").textContent = "连接已加密 · 文件尚未开始发送";
         }
         if (state === "transferring") {
           scope.transferStarted = true;
@@ -1042,7 +1073,8 @@
         if (state === "failed") {
           roomActive = false;
           recordUiPhase(scope, "failed", scope.relayFailure?.code ?? "TRANSFER_FAILED");
-          showError("sender", scope.relayFailure ? errorMessage(scope.relayFailure) : "文件传输失败，请重新开始");
+          const failure = diagnosticFor(scope);
+          showError("sender", failure.errorCode === "TRANSFER_FAILED" ? "文件传输失败，请重新开始" : errorMessage({ code: failure.errorCode }));
         }
         if (TERMINAL_TRANSFER_STATES.has(state)) {
           // Success closes from the sender only, after the receiver's final receipt.
@@ -1096,6 +1128,21 @@
       [senderEngine, receiverEngine].every((engine) => !engine || ["idle", "awaiting_acceptance"].includes(engine.state));
   }
 
+  function renderRouteActions() {
+    const scope = sessionScope;
+    const available = isDemo
+      ? byId("sender-relay-pending").hidden && (!byId("sender-connected").hidden || !byId("sender-route-failed").hidden)
+      : scope?.role === "sender" && scope.peerJoined && roomActive && canChangeRoute(scope) &&
+        !scope.relayRequested && !scope.relayOpening && !scope.relayActive;
+    // A departed peer disables same-room relay, but must not hide the action
+    // that creates a new room with the original file selection.
+    const retry = !byId("sender-route-failed").hidden;
+    byId("sender-route-actions").hidden = !(available && relayEnabled || retry);
+    byId("use-relay-button").hidden = !relayEnabled || !available;
+    byId("use-relay-button").disabled = !relayEnabled || !available;
+    byId("retry-direct-button").hidden = !retry;
+  }
+
   function retirePendingDirect(scope) {
     scope.storageCheck?.controller.abort();
     scope.storageCheck = null;
@@ -1136,6 +1183,7 @@
       byId("sender-route-failed").querySelector(".decision-code").textContent =
         `${event.code}${Number.isFinite(event.elapsedMs) ? ` · ${(event.elapsedMs / 1_000).toFixed(1)}s` : ""}`;
       byId("sender-route-fact").textContent = `${message} · 未切换传输方式`;
+      renderRouteActions();
     } else {
       showReceiverStage(byId("receiver-searching"));
       byId("receiver-title").textContent = "直连未成功，等待发送方选择";
@@ -1149,8 +1197,7 @@
   function handleSessionEvent(event) {
     if (event.type === "phase") {
       if (sessionScope.diagnosticPhase) return;
-      const { type, ...snapshot } = event;
-      renderTimeline(sessionScope.role, snapshot);
+      renderTimeline(sessionScope.role, diagnosticFor(sessionScope));
       return;
     }
     if ((sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive || sessionScope.directFailed) && (
@@ -1176,6 +1223,9 @@
       byId("join-request").hidden = true;
       byId("sender-connected").hidden = true;
       byId("sender-progress").hidden = true;
+      byId("sender-route-failed").hidden = true;
+      byId("sender-relay-pending").hidden = true;
+      renderRouteActions();
       updateExpiry(event.expiresAt);
       announce("接收码已生成，等待另一台电脑");
       return;
@@ -1200,11 +1250,14 @@
     }
     if (event.type === "peer_joined") {
       roomActive = true;
+      sessionScope.route = "direct";
+      sessionScope.peerJoined = true;
       if (event.role === "sender") {
         byId("join-request").hidden = true;
         byId("sender-connected").hidden = false;
         byId("sender-connected").querySelector("strong").textContent = "正在建立局域网直连…";
         byId("sender-connected").querySelector("small").textContent = "正在协商加密通道";
+        renderRouteActions();
       } else {
         showReceiverStage(byId("receiver-searching"));
         byId("receiver-title").textContent = "正在建立局域网直连";
@@ -1256,6 +1309,7 @@
       }
       retirePendingDirect(sessionScope);
       sessionScope.relayRequested = true;
+      sessionScope.route = "local_relay";
       session?.closeDirect();
       recordUiPhase(sessionScope, "relay_pending");
       byId("approve-relay-button").disabled = !relayEnabled;
@@ -1270,6 +1324,10 @@
       recordUiPhase(sessionScope, "failed", "RELAY_DECLINED");
       byId("sender-relay-pending").hidden = true;
       byId("sender-route-failed").hidden = false;
+      byId("sender-route-failed").querySelector(".decision-code").textContent = "RELAY_DECLINED";
+      byId("sender-route-fact").textContent = "中转已拒绝 · 尚未传输";
+      byId("sender-relay-fact").textContent = "接收方已拒绝";
+      renderRouteActions();
       showError("sender", "接收方拒绝了本地中转，本次仍未发送文件内容");
       return;
     }
@@ -1316,6 +1374,8 @@
             sessionScope.relayRequested = false;
             byId("sender-relay-pending").hidden = true;
             byId("sender-route-failed").hidden = false;
+            byId("sender-route-failed").querySelector(".decision-code").textContent = UI_ERROR_CODES.has(event.code) ? event.code : "UNKNOWN";
+            renderRouteActions();
           }
         }
         if (
@@ -1513,14 +1573,20 @@
   byId("use-relay-button").addEventListener("click", () => {
     if (!relayEnabled) return;
     if (!isDemo) {
-      if (!canChangeRoute(sessionScope) || !sessionScope.directFailed) return;
+      if (!canChangeRoute(sessionScope) || !sessionScope.peerJoined || !roomActive ||
+          sessionScope.relayRequested || sessionScope.relayOpening || sessionScope.relayActive) return;
       retirePendingDirect(sessionScope);
       sessionScope.relayRequested = true;
+      sessionScope.route = "local_relay";
       session.closeDirect();
       recordUiPhase(sessionScope, "relay_pending");
     }
+    if (demoTimer) clearTimeout(demoTimer);
+    clearErrors();
+    byId("sender-connected").hidden = true;
     byId("sender-route-failed").hidden = true;
     byId("sender-relay-pending").hidden = false;
+    renderRouteActions();
     byId("sender-route-fact").textContent = "本地中转 · 等待确认";
     byId("sender-relay-fact").textContent = "接收方确认中";
     announce("已申请本地中转，等待接收方同意");
@@ -1532,6 +1598,7 @@
     if (isDemo) {
       byId("sender-connected").hidden = false;
       byId("sender-route-timeline").hidden = false;
+      renderRouteActions();
       announce("已重新开始寻找局域网直连");
       return;
     }
@@ -1687,12 +1754,11 @@
   }
 
   function renderRelayAvailability() {
-    byId("use-relay-button").hidden = !relayEnabled;
-    byId("use-relay-button").disabled = !relayEnabled;
+    renderRouteActions();
     byId("approve-relay-button").disabled = !relayEnabled;
     byId("relay-disabled-notice").hidden = relayEnabled;
     byId("home-relay-policy").textContent = relayEnabled
-      ? "默认浏览器直连；直连失败时，只有双方确认才会经过运行渡口服务的电脑内存中转。"
+      ? "默认浏览器直连；传输前可申请本地中转，双方确认后经运行渡口服务的电脑内存转发。"
       : "本地中转已关闭或不可用；当前仅使用浏览器直连。";
   }
 
